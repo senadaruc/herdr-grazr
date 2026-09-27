@@ -4,6 +4,17 @@ Notable changes to *grazr*, newest first. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.4.4 - 2026-09-27
+
+### Fixed
+
+- A fresh week no longer hands over for a few points. A lightly used week
+  reads as fresh for days, and every time the other account's session had
+  room again *grazr* moved there for its week that ends sooner, then back
+  five hours later when that session ran low. The handover now needs the
+  same ten points above the weekly threshold as the last-day rule. Less is
+  not worth two swaps.
+
 ## 0.4.3 - 2026-09-25
 
 ### Fixed
