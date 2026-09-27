@@ -205,6 +205,14 @@ class ExpiringSoonerTest(unittest.TestCase):
             ("rotate", "sooner"),
         )
 
+    def test_a_fresh_week_does_not_hand_over_for_crumbs_either(self):
+        """A lightly used week reads as fresh for days, and a handover for a
+        few points then costs two swaps for nearly nothing."""
+        self.assertEqual(
+            decide(self.fresh_week(), "work", [self.ending_in(2, remaining=29)], now=NOW, thresholds=THRESHOLDS),
+            "stay",
+        )
+
     def test_a_week_already_in_use_does_not_hand_over(self):
         """Handing over on every message would undo each session swap five
         hours later. A reset is the one moment worth a swap of its own."""

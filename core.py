@@ -115,8 +115,10 @@ def expiring_sooner(limits, active, accounts, now, thresholds):
     """The first account fit to take over whose week ends before the active
     account's, or None. What it has left is lost at its reset unless spent
     first. So that this does not undo every session swap five hours later, it
-    fires only when the active week has just reset, or in the last day of the
-    other account's week when enough is left there to be worth two swaps."""
+    fires only when the active week has just reset or the other account's
+    week is in its last day, and only when enough is left there to be worth
+    two swaps. A lightly used week reads as fresh for days, so the floor
+    applies to both."""
     weeks = [limit for limit in limits if limit.group == "weekly" and limit.resets_at and limit.resets_at > now]
     if not weeks:
         return None
@@ -132,7 +134,7 @@ def expiring_sooner(limits, active, accounts, now, thresholds):
                 continue
             worth_it = limit.remaining >= thresholds.get("weekly", 0) + FALLBACK_MARGIN
             last_day = (limit.resets_at - now).total_seconds() <= LAST_DAY_SECONDS
-            if fresh or (last_day and worth_it):
+            if worth_it and (fresh or last_day):
                 return candidate.id
     return None
 
