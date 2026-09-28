@@ -476,8 +476,7 @@ def statusline(runtime=None, payload=None, spawn=subprocess.run, detach=None):
     with _file_lock(os.path.join(state_dir, "readings.lock"), wait=True):
         previous = _latest_reading(paths, active)
         name = _name_of(enrolled, active)
-        for expired in core.replaced(previous, limits, now):
-            _log(state_dir, now, "%s %s window reset with %d%% left" % (name, expired.group, expired.remaining))
+        _log_leftovers(state_dir, now, name, core.replaced(previous, limits, now))
         limits = core.merged(previous, limits, now)
         # An idle pane repeats an old figure every minute, and a payload can
         # lack a window that ran out while the account was parked. Either can
@@ -487,6 +486,16 @@ def statusline(runtime=None, payload=None, spawn=subprocess.run, detach=None):
             _log(state_dir, now, "First reading on %s after the swap: %s" % (name, _cost(previous, limits)))
             accounts.mark_first_reading_due(paths, active, due=False)
         accounts.record_snapshot(paths, active, limits)
+        # A parked account is the one grazr chose to leave, so what its window
+        # had left when it ran out is the number that says whether leaving was
+        # right. Nobody reads for it, so its record is checked here instead.
+        for parked in enrolled:
+            if parked.id == active or not isinstance(parked.snapshot, list):
+                continue
+            expired = core.replaced(parked.snapshot, [], now)
+            if expired:
+                _log_leftovers(state_dir, now, parked.name, expired)
+                accounts.record_snapshot(paths, parked.id, core.merged(parked.snapshot, [], now))
     if not core.needs_rotation(limits, now, config.thresholds) and not core.expiring_sooner(
         limits, active, enrolled, now, config.thresholds
     ):
@@ -496,6 +505,11 @@ def statusline(runtime=None, payload=None, spawn=subprocess.run, detach=None):
         return 0
     (detach or (lambda: _detach_decide(state_dir)))()
     return 0
+
+
+def _log_leftovers(state_dir, now, name, expired):
+    for window in expired:
+        _log(state_dir, now, "%s %s window reset with %d%% left" % (name, window.group, window.remaining))
 
 
 def _cost(parked, limits):

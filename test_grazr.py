@@ -2803,6 +2803,20 @@ class StatuslineTest(EnrolledPairFixture):
         self.assertEqual(logged.count("First reading"), 1, logged)
         self.assertIn("First reading on personal after the swap: session 50% -> 45%", logged)
 
+    def test_a_parked_account_logs_what_its_window_had_left_when_it_ran_out(self):
+        """The parked account is the one grazr chose to leave, so its leftover
+        is the number that says whether leaving was right. Once, not on every
+        reading of the account you are on."""
+        now = datetime.now(timezone.utc)
+        self.write_account_snapshot("uuid-personal", 4, now - timedelta(minutes=1))
+
+        for _ in range(2):
+            self.run_statusline(self.payload(used=10, resets_at=int((now + timedelta(hours=4)).timestamp())))
+
+        with open(os.path.join(self.state_dir, "grazr.log")) as handle:
+            logged = handle.read()
+        self.assertEqual(logged.count("personal session window reset with 4% left"), 1, logged)
+
     def test_a_window_replaced_by_a_newer_one_logs_what_it_had_left(self):
         """What is left at a reset is lost, and how much that is decides
         whether the thresholds are right."""
