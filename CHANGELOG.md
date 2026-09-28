@@ -4,6 +4,16 @@ Notable changes to *grazr*, newest first. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.4.5 - 2026-09-28
+
+### Fixed
+
+- A parked account's leftover is logged when its window runs out. The line
+  only looked at the account you are on, and the account *grazr* left is
+  the one whose leftover says whether leaving was right. Its record is now
+  checked on every reading, the window that ran out is logged once, and it
+  is dropped from the record.
+
 ## 0.4.4 - 2026-09-27
 
 ### Fixed
