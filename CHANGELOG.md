@@ -8,6 +8,16 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- An account the server refuses is left for the next one. A lapsed
+  subscription, a billing problem, an organisation that turned Claude Code off,
+  a revoked login or a rate limit ends the turn without a status-line reading,
+  so *grazr* saw nothing and kept every pane on the dead account. It now also
+  connects to Claude's `StopFailure` hook. On an account-level error it marks
+  the account failed, skips it until it is enrolled again or seen answering,
+  and moves to the next one. On a rate limit the account waits for its window
+  to reset. Only the first of many failing panes acts, and failures in the
+  first minute after a swap are put down to the account that left. Run the
+  connect action once to add the hook.
 - `MODEL_LIMITS=1` watches per-model weekly limits too. Some plans cap a model
   on its own, and that cap runs out while the all-models week still has room.
   Claude leaves it out of the status line, so *grazr* never saw it and a pane

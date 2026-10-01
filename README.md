@@ -169,6 +169,29 @@ only while that account is live. It never refreshes a parked token to ask, so
 a swap can land on an account that is also out of that model, and *grazr*
 moves on after the next reading.
 
+### When the server refuses an account
+
+Usage is not the only way an account stops. A lapsed subscription, a billing
+problem, an organisation that turned off Claude Code, a revoked login or a
+rate limit the status line never got to warn about all end the turn with an
+error instead. The status line never runs for a refused request, so *grazr*
+also connects to Claude's `StopFailure` hook. The connect action adds it
+next to any hooks you have, and the disconnect action takes only its own out.
+
+On `oauth_org_not_allowed`, `billing_error`, `account_on_hold` or
+`authentication_failed`, *grazr* marks the account as failed and moves to the
+next one in `ACCOUNTS` with headroom. A failed account is never a target
+again until you enrol it again, or until a pane on it reports usage that has
+gone down, which only an answered request can produce. The status pane shows
+it as `FAILED`. On `rate_limit` the account's lowest open window is set to
+nothing, so it comes back by itself when that window resets.
+
+Every pane and teammate on the account fails at once. Only the first one acts.
+The rest find another account live, and a failure in the first minute after
+an account arrives belongs to requests sent before it did. Claude re-reads its
+credential before its next request, so a pane that failed only needs its next
+message: press `Esc` and send again. A cleared `/goal` has to be set again.
+
 ## Swap on demand
 
 Sometimes you do not want to wait for the threshold. The session is at 93% and
@@ -257,9 +280,9 @@ because repainting one can jump it to the bottom.
 - Act on a reading from an account it has left. A session keeps reporting the
   old account until its next request, and *grazr* tells those readings apart by
   the window's reset time and drops them.
-- Touch a pane that already hit the wall. *grazr* swaps before that. If a pane
-  does show a limit, press `Esc` and send again, and it goes out on the new
-  account.
+- Touch a pane that already hit the wall. *grazr* swaps before that, and after
+  a refused request it swaps away, but it never types into the pane. Press
+  `Esc` and send again, and it goes out on the new account.
 - Write a credential it cannot write whole. macOS `security` quietly truncates
   an over-long input and destroys the item, so *grazr* measures first and
   refuses.
