@@ -22,6 +22,12 @@ import grazr
 import stores
 from core import Account, Limit, decide, merged, next_account
 
+
+def setUpModule():
+    # The local OSC 777 forwarder is real on cloud-dev, and a test run must
+    # not toast every client attached there.
+    grazr.OSC777_SCRIPT = "/nonexistent/notify-send-osc777.sh"
+
 NOW = datetime(2026, 9, 4, 12, 0, tzinfo=timezone.utc)
 LATER = datetime(2026, 9, 4, 17, 0, tzinfo=timezone.utc)
 EARLIER = datetime(2026, 9, 4, 7, 0, tzinfo=timezone.utc)
@@ -2080,6 +2086,22 @@ class NotifyTest(unittest.TestCase):
 
         self.assertFalse(shown)
         self.assertIsNone(argv)
+
+    def test_the_toast_is_also_forwarded_as_osc_777(self):
+        """LOCAL PATCH: cmux over SSH ignores Herdr's OSC 99 toasts."""
+        with tempfile.NamedTemporaryFile() as script, mock.patch.object(
+            grazr, "OSC777_SCRIPT", script.name
+        ), mock.patch.object(grazr.subprocess, "Popen") as popen:
+            self.notify({"result": {"shown": True}})
+
+        self.assertEqual(popen.call_args[0][0], [script.name, "t", "b"])
+
+    def test_a_missing_osc_777_script_is_skipped(self):
+        with mock.patch.object(grazr.subprocess, "Popen") as popen:
+            shown, _ = self.notify({"result": {"shown": True}})
+
+        self.assertTrue(shown)
+        popen.assert_not_called()
 
 
 class ActOnDecisionTest(unittest.TestCase):
