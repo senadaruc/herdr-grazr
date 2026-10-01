@@ -863,7 +863,11 @@ def recover(runtime=None, error=None, failed=None, now=None):
             entry._replace(snapshot=_relevant(entry.snapshot, models))
             for entry in _usable(state_dir, accounts.load(paths, config.accounts), active, now)
         ]
-        next_id = core.next_account(active, enrolled, now, config.thresholds)
+        # The account just stopped answering, whatever its reading says, so an
+        # account below the thresholds still beats it.
+        next_id = core.next_account(active, enrolled, now, config.thresholds) or core.last_resort(
+            active, enrolled, now, config.thresholds
+        )
         if next_id is None:
             line = "%s, and no other account has headroom" % reason
             if not _announce_once(state_dir, "failed:%s:%s" % (active, error), "grazr: nowhere to go", line):

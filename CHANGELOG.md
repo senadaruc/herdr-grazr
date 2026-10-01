@@ -27,6 +27,16 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   a pane is on that model. It is off by default, since the endpoint is
   undocumented.
 
+### Fixed
+
+- A spent account is left even when every other account is below the
+  thresholds. The thresholds are a margin for leaving early, but they also
+  ruled out every account once all were under them, so a rate-limited account
+  stayed live until its reset while another still had 14% of its week and a
+  whole session. When the live account is refused or has 2% or less left,
+  *grazr* now moves to the account with the most left in its tightest window,
+  as long as that is more than 2%.
+
 ## 0.3.7 - 2026-09-25
 
 ### Fixed

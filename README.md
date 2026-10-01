@@ -280,6 +280,9 @@ because repainting one can jump it to the bottom.
 - Act on a reading from an account it has left. A session keeps reporting the
   old account until its next request, and *grazr* tells those readings apart by
   the window's reset time and drops them.
+- Stay on a spent account while another has anything left. Once the live
+  account is refused or down to 2%, the thresholds stop counting: *grazr* moves
+  to the account with the most left, even if every account is below them.
 - Touch a pane that already hit the wall. *grazr* swaps before that, and after
   a refused request it swaps away, but it never types into the pane. Press
   `Esc` and send again, and it goes out on the new account.

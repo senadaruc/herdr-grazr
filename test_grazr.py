@@ -251,6 +251,81 @@ class ThresholdBoundaryTest(unittest.TestCase):
         )
 
 
+class LastResortTest(unittest.TestCase):
+    """A spent live account moves to whatever has the most left, below the
+    thresholds or not. On 2026-10-01 a swarm sat on an account at 0% for four
+    hours while another had 14% of its week and a whole session left."""
+
+    def test_a_spent_account_moves_to_the_most_left_below_the_thresholds(self):
+        limits = [limit(group="session", remaining=0)]
+        accounts = [
+            account("work"),
+            account("gmail", snapshot=[limit(group="weekly", remaining=12)]),
+            account("icloud", snapshot=[
+                limit(group="session", remaining=99, resets_at=EARLIER),
+                limit(group="weekly", remaining=14),
+            ]),
+            account("team", snapshot=[limit(group="session", remaining=11)]),
+        ]
+
+        self.assertEqual(
+            decide(limits, active="work", accounts=accounts, now=NOW, thresholds=THRESHOLDS),
+            ("rotate", "icloud"),
+        )
+
+    def test_an_account_merely_below_the_thresholds_stays(self):
+        """Nothing beats a margin of its own yet, and moving would churn."""
+        limits = [limit(group="session", remaining=14)]
+        low = account("low", snapshot=[limit(group="weekly", remaining=10)])
+
+        self.assertEqual(
+            decide(limits, active="work", accounts=[account("work"), low], now=NOW, thresholds=THRESHOLDS),
+            "exhausted",
+        )
+
+    def test_spent_is_at_or_below_the_floor(self):
+        low = account("low", snapshot=[limit(group="weekly", remaining=10)])
+        for remaining, expected in ((3, "exhausted"), (2, ("rotate", "low")), (0, ("rotate", "low"))):
+            with self.subTest(remaining=remaining):
+                self.assertEqual(
+                    decide(
+                        [limit(group="session", remaining=remaining)],
+                        active="work",
+                        accounts=[account("work"), low],
+                        now=NOW,
+                        thresholds=THRESHOLDS,
+                    ),
+                    expected,
+                )
+
+    def test_a_candidate_spent_too_is_no_way_out(self):
+        nearly = account("nearly", snapshot=[limit(group="weekly", remaining=2)])
+
+        self.assertEqual(
+            decide(
+                [limit(group="session", remaining=0)],
+                active="work",
+                accounts=[account("work"), nearly],
+                now=NOW,
+                thresholds=THRESHOLDS,
+            ),
+            "exhausted",
+        )
+
+    def test_a_tie_goes_to_preference_order(self):
+        accounts = [
+            account("work"),
+            account("first", snapshot=[limit(group="weekly", remaining=10)]),
+            account("second", snapshot=[limit(group="weekly", remaining=10)]),
+        ]
+
+        self.assertEqual(
+            decide([limit(group="session", remaining=0)], active="work", accounts=accounts,
+                   now=NOW, thresholds=THRESHOLDS),
+            ("rotate", "first"),
+        )
+
+
 class TwoWeeklyLimitsTest(unittest.TestCase):
     """The per-model weekly limit must not be collapsed into the overall one."""
 
@@ -3527,6 +3602,40 @@ class RecoverTest(EnrolledPairFixture):
         self.assertEqual(snapshot[0]["remaining"], 0)
         self.assertNotIn("uuid-work", self.blocked())
         self.assertEqual(len(self.rotations), 1)
+
+    def test_a_rate_limit_moves_to_an_account_below_the_thresholds(self):
+        """Stuck on a dead account until its reset is worse than any headroom."""
+        self.write_account_snapshot("uuid-work", remaining=40)
+        self.write_account_snapshot("uuid-personal", remaining=10)
+
+        self.recover(error="rate_limit")
+
+        self.assertEqual(self.rotations[0][2:4], ("uuid-work", "uuid-personal"))
+        self.assertIn("work failed with rate_limit. Rotated work -> personal", self.logged())
+
+    def test_a_refused_account_moves_to_an_account_below_the_thresholds(self):
+        self.write_account_snapshot("uuid-personal", remaining=10)
+
+        self.recover()
+
+        self.assertEqual(self.rotations[0][2:4], ("uuid-work", "uuid-personal"))
+
+    def test_a_rate_limit_with_every_other_account_spent_stays(self):
+        self.write_account_snapshot("uuid-work", remaining=40)
+        self.write_account_snapshot("uuid-personal", remaining=2)
+
+        self.recover(error="rate_limit")
+
+        self.assertEqual(self.rotations, [])
+        self.assertIn("work failed with rate_limit, and no other account has headroom", self.logged())
+
+    def test_the_threshold_decision_leaves_a_spent_account_for_a_low_one(self):
+        self.write_account_snapshot("uuid-work", remaining=1)
+        self.write_account_snapshot("uuid-personal", remaining=10)
+
+        self.invoke(grazr.decide)
+
+        self.assertEqual(self.rotations[0][2:4], ("uuid-work", "uuid-personal"))
 
     def test_a_rate_limit_with_no_window_on_record_waits_a_fixed_time(self):
         self.recover(error="rate_limit")
