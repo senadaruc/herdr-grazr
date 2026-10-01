@@ -73,6 +73,25 @@ NOTIFY_TIMEOUT_SECONDS = 5
 TAG_TIMEOUT_SECONDS = 5
 STATUSLINE_TIMEOUT_SECONDS = 5
 
+# LOCAL PATCH (cloud-dev, 2026-09-20): this box is headless and its client is
+# cmux over SSH, which ignores Herdr's OSC 99 toasts. Every toast is also
+# forwarded as OSC 777 through this script, which cmux does show.
+OSC777_SCRIPT = os.path.expanduser("~/.config/herdr/notify/notify-send-osc777.sh")
+
+
+def _forward_osc777(title, body):
+    """Best effort, and never waited on: a toast is not worth a stuck pane."""
+    if not os.path.exists(OSC777_SCRIPT):
+        return
+    try:
+        subprocess.Popen(
+            [OSC777_SCRIPT, title, body],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError:
+        pass
+
 
 def notify(title, body, spawn=subprocess.run):
     """Herdr's own toast. Returns whether it was actually shown.
@@ -92,6 +111,7 @@ def notify(title, body, spawn=subprocess.run):
     herdr = os.environ.get("HERDR_BIN_PATH")
     if not herdr:
         return False
+    _forward_osc777(title, body)
     try:
         completed = spawn(
             [herdr, "notification", "show", title, "--body", body, "--sound", "request"],
