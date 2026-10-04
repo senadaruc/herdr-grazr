@@ -4,6 +4,17 @@ Notable changes to *grazr*, newest first. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.4.6 - 2026-10-04
+
+### Fixed
+
+- No more false "cannot read Claude's usage" toasts after a weekly reset.
+  Once both windows have run out and before the next request, Claude's
+  status line carries no limits at all, and a session that missed twice set
+  off the warning meant for a renamed field. A session that has carried
+  limits before has proven the field name, so its later misses are now left
+  alone. A session that never carries any still warns.
+
 ## 0.4.5 - 2026-09-28
 
 ### Fixed
