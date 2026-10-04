@@ -8,15 +8,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- A login with many MCP servers can be parked again. The outgoing credential
-  was parked whole, MCP logins included, and with enough of them it ran past
-  the macOS keychain's line limit. The refusal is right, since the keychain
-  would truncate the item, but it stopped every swap before anything moved,
-  and enrolling such a login failed the same way. The MCP logins are left out
-  of the parked copy now. They were never read from it: a swap carries the
-  live ones onto the arriving credential, and a parked copy only ever
-  resurfaced as stale logins when the live credential had none. Reported in
-  issue 2.
+- Swaps and enrolment work again for a login with many MCP servers. The
+  parked copy of a credential leaves out the MCP logins now. With enough of
+  them it was too long for the macOS keychain, and the refusal stopped every
+  swap. A swap never read them from the parked copy anyway: it carries the
+  live ones onto the arriving credential. Issue 2.
 
 ## 0.4.6 - 2026-10-04
 
