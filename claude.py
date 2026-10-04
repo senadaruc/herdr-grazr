@@ -162,7 +162,7 @@ def enrol(paths, store, name, source_config_dir=None):
         if existing.name == name and existing.id != account_id:
             raise RuntimeError("The name %r is already used by another account" % name)
 
-    store.write_parked(account_id, blob)
+    store.write_parked(account_id, _parkable(blob))
     accounts.write(
         paths,
         account_id,
@@ -225,9 +225,10 @@ def rotate(paths, store, active_id, next_id, snapshot):
         renew()
         pending = _pending_swap(paths, store, active_id, leaving)
         if pending is None:
+            parking = _parkable(leaving)
             # The marker goes first, so a retry can tell how far this got.
-            _write_swap_marker(paths, active_id, next_id, leaving)
-            store.write_parked(active_id, leaving)
+            _write_swap_marker(paths, active_id, next_id, parking)
+            store.write_parked(active_id, parking)
             renew()
             try:
                 store.write_live(_carry_shared_keys(arriving, leaving))
@@ -407,7 +408,7 @@ def _pending_swap(paths, store, active_id, live):
     if pending is None or pending["active"] != active_id:
         _clear_swap_marker(paths)
         return None
-    if _digest(live) == pending["leaving"]:
+    if _digest(_parkable(live)) == pending["leaving"]:
         _clear_swap_marker(paths)
         return None
     arrived = store.read_parked(pending["next"])
@@ -456,6 +457,17 @@ def _same_login(one, other):
     """Same login, whatever MCP logins ride along. A swap carries those onto
     the arriving blob, so the live copy stops matching its parked one."""
     return _without_carried(one) == _without_carried(other)
+
+
+def _parkable(blob):
+    """The credential without the keys a swap carries. A parked copy of them
+    is never read, since the carry takes the live ones on the way back in, and
+    with enough MCP servers they push the keychain line past its limit. A blob
+    with nothing to strip stays byte for byte, like the carry does."""
+    stripped = _without_carried(blob)
+    if not isinstance(stripped, dict) or stripped == json.loads(blob):
+        return blob
+    return json.dumps(stripped)
 
 
 def _without_carried(blob):

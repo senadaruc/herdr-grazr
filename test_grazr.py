@@ -1216,6 +1216,28 @@ class RotateTest(unittest.TestCase):
 
         self.assertEqual(self.store.live, arriving)
 
+    def test_the_mcp_logins_are_not_parked(self):
+        """A parked copy of them is never read, since the carry takes the live
+        ones on the way back in. And with enough MCP servers they push the
+        keychain line past its limit, which refused every swap before anything
+        had moved."""
+        self.store.live = json.dumps(
+            {
+                "claudeAiOauth": {"accessToken": "work-token"},
+                "mcpOAuth": {"linear": {"accessToken": "x" * 200}},
+            }
+        )
+        self.store.parked["uuid-personal"] = json.dumps(
+            {"claudeAiOauth": {"accessToken": "personal-token"}}
+        )
+
+        self.run_rotate()
+
+        self.assertEqual(
+            json.loads(self.store.parked["uuid-work"]), {"claudeAiOauth": {"accessToken": "work-token"}}
+        )
+        self.assertIn("mcpOAuth", json.loads(self.store.live))
+
     def test_an_account_scoped_key_does_not_follow_the_swap(self):
         """The other side of the allowlist: Claude's own logout drops this key,
         so it belongs to the account leaving and must not reach the one
@@ -1528,6 +1550,17 @@ class EnrolTest(unittest.TestCase):
 
     def run_enrol(self, name="work", source=None):
         return claude.enrol(self.paths, self.store, name, source)
+
+    def test_it_parks_the_login_without_the_mcp_logins(self):
+        self.store.live = json.dumps(
+            {"claudeAiOauth": {"accessToken": "work-token"}, "mcpOAuth": {"linear": {"accessToken": "m"}}}
+        )
+
+        self.run_enrol()
+
+        self.assertEqual(
+            json.loads(self.store.parked[self.WORK]), {"claudeAiOauth": {"accessToken": "work-token"}}
+        )
 
     def test_it_parks_the_live_credential_under_the_account_uuid(self):
         identifier = self.run_enrol()
