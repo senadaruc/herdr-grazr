@@ -4,6 +4,20 @@ Notable changes to *grazr*, newest first. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.4.7 - 2026-10-04
+
+### Fixed
+
+- A login with many MCP servers can be parked again. The outgoing credential
+  was parked whole, MCP logins included, and with enough of them it ran past
+  the macOS keychain's line limit. The refusal is right, since the keychain
+  would truncate the item, but it stopped every swap before anything moved,
+  and enrolling such a login failed the same way. The MCP logins are left out
+  of the parked copy now. They were never read from it: a swap carries the
+  live ones onto the arriving credential, and a parked copy only ever
+  resurfaced as stale logins when the live credential had none. Reported in
+  issue 2.
+
 ## 0.4.6 - 2026-10-04
 
 ### Fixed
