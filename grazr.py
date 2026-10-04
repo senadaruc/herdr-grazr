@@ -51,6 +51,9 @@ PREVIOUS_STATUSLINE = "statusline.previous.json"
 UNREADABLE_PENDING = "statusline.unreadable.json"
 # Only a live session can miss twice, so the armed set never needs to be large.
 UNREADABLE_PENDING_CAP = 64
+# No Claude version is the empty string, so it marks a session that has
+# carried limits and can never be a renamed field.
+PROVEN = ""
 
 TAG = "grazr"
 ESCAPE = "\x1b"
@@ -560,6 +563,11 @@ def _warn_unreadable(state_dir, payload):
     if not spoken or not session:
         return
     armed = _pending_unreadable(state_dir)
+    # A session that has carried limits before has proven the field name. Its
+    # later misses are a window that ran out before the next request, which is
+    # what every payload looks like right after a weekly reset.
+    if armed.get(session) == PROVEN:
+        return
     if session not in armed:
         armed[session] = version
         if len(armed) > UNREADABLE_PENDING_CAP:
@@ -572,20 +580,26 @@ def _warn_unreadable(state_dir, payload):
 
 
 def _disarm_unreadable(state_dir, payload):
-    """A reading that carries limits proves the session can read them."""
+    """A reading that carries limits proves the session can read them, for
+    good."""
     try:
         session = json.loads(payload).get("session_id")
     except (ValueError, AttributeError):
         return
+    if not session:
+        return
     armed = _pending_unreadable(state_dir)
-    if session in armed:
-        del armed[session]
+    if armed.get(session) != PROVEN:
+        armed[session] = PROVEN
+        if len(armed) > UNREADABLE_PENDING_CAP:
+            armed.pop(next(iter(armed)))
         _write_pending_unreadable(state_dir, armed)
 
 
 def _pending_unreadable(state_dir):
-    """Sessions that have missed once, mapped to their Claude version. The old
-    list format is read as empty, so the upgrade starts fresh."""
+    """Sessions that have missed once, mapped to their Claude version, and
+    sessions that have carried limits, mapped to PROVEN. The old list format
+    is read as empty, so the upgrade starts fresh."""
     try:
         with open(os.path.join(state_dir, UNREADABLE_PENDING)) as handle:
             armed = json.load(handle)

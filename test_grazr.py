@@ -3012,6 +3012,22 @@ class StatuslineTest(EnrolledPairFixture):
 
         self.assertEqual(self.notices, [])
 
+    def test_a_session_that_once_carried_limits_never_warns(self):
+        """After a weekly reset Claude's payload carries no limits until the
+        next request. A session that delivered limits before has proven the
+        field name, so two misses there are not a renamed field."""
+        reading = json.dumps({"session_id": "s", "version": "9.9.9",
+                             "context_window": {"total_input_tokens": 512},
+                             "rate_limits": {"five_hour": {"used_percentage": 10, "resets_at": None}}})
+        blind = json.dumps({"session_id": "s", "version": "9.9.9",
+                            "context_window": {"total_input_tokens": 512}})
+
+        self.run_statusline(reading)
+        self.run_statusline(blind)
+        self.run_statusline(blind)
+
+        self.assertEqual(self.notices, [])
+
     def test_one_session_missing_twice_still_warns(self):
         """A session that completes two turns and never once gets usage is the
         renamed-field case the warning exists for."""
