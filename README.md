@@ -8,6 +8,12 @@
 <p align="center">Rotational grazing for <a href="https://claude.com/claude-code">Claude Code</a>: moves the herd to a fresh account before the pasture runs out, in the middle of a message and with no restart.<br>A <a href="https://herdr.dev">Herdr</a> plugin.</p>
 <br>
 
+> **senadaruc's fork.** This is [wazum/herdr-grazr](https://github.com/wazum/herdr-grazr)
+> 0.4.7 with per-model weekly limits (`MODEL_LIMITS=1`), leaving an account the
+> server refuses, `grazr.py swap <account>`, and toast forwarding for cmux. The
+> plugin id stays `wazum.grazr`, so it replaces the original in place: config,
+> enrolled accounts and parked credentials carry over.
+
 <p align="center">
   <a href="https://github.com/wazum/herdr-grazr/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/wazum/herdr-grazr/ci.yml?branch=main&style=for-the-badge&logo=githubactions&logoColor=white&label=CI&labelColor=24273a" alt="CI"></a>
   <img src="https://img.shields.io/badge/Platform-macOS%20%7C%20Linux-ffb997?style=for-the-badge&labelColor=24273a" alt="macOS and Linux">
@@ -74,7 +80,7 @@ files hold only names, identities and the last known headroom.
 ## Install
 
 ```sh
-herdr plugin install wazum/herdr-grazr
+herdr plugin install senadaruc/herdr-grazr
 ```
 
 Then enrol each account:
