@@ -24,24 +24,28 @@ def merged(previous, current, now):
     taken at all, so a repeat cannot bring it back once it was dropped."""
     if not isinstance(previous, list):
         return _live(current, now)
-    lowest = {(entry.group, entry.resets_at): entry.remaining for entry in previous}
+    # Keyed by scope too: a per-model weekly limit shares its reset with the
+    # all-models one, and must never lend it its lower headroom.
+    lowest = {(entry.group, entry.scope, entry.resets_at): entry.remaining for entry in previous}
     newest = {
-        (entry.kind, entry.group): entry
+        (entry.kind, entry.group, entry.scope): entry
         for entry in sorted((entry for entry in previous if entry.resets_at), key=lambda entry: entry.resets_at)
     }
     readings = []
     for entry in current:
-        recorded = newest.get((entry.kind, entry.group))
+        recorded = newest.get((entry.kind, entry.group, entry.scope))
         if recorded and entry.resets_at and entry.resets_at < recorded.resets_at:
             readings.append(recorded)
             continue
         readings.append(
             entry._replace(
-                remaining=min(entry.remaining, lowest.get((entry.group, entry.resets_at), entry.remaining))
+                remaining=min(
+                    entry.remaining, lowest.get((entry.group, entry.scope, entry.resets_at), entry.remaining)
+                )
             )
         )
-    covered = {(entry.kind, entry.group) for entry in current}
-    readings += [entry for entry in previous if (entry.kind, entry.group) not in covered]
+    covered = {(entry.kind, entry.group, entry.scope) for entry in current}
+    readings += [entry for entry in previous if (entry.kind, entry.group, entry.scope) not in covered]
     return _live(readings, now)
 
 
@@ -50,12 +54,12 @@ def moved(previous, current):
     or a new one opened. A payload that merely lacks a window, or repeats one,
     shows none."""
     recorded = {
-        (entry.kind, entry.group, entry.resets_at): entry.remaining
+        (entry.kind, entry.group, entry.scope, entry.resets_at): entry.remaining
         for entry in (previous if isinstance(previous, list) else [])
     }
     return any(
-        (entry.kind, entry.group, entry.resets_at) not in recorded
-        or entry.remaining < recorded[(entry.kind, entry.group, entry.resets_at)]
+        (entry.kind, entry.group, entry.scope, entry.resets_at) not in recorded
+        or entry.remaining < recorded[(entry.kind, entry.group, entry.scope, entry.resets_at)]
         for entry in current
     )
 
@@ -71,12 +75,15 @@ def replaced(previous, current, now):
     reset passes, and the newer window arrives only with the next request."""
     if not isinstance(previous, list):
         return []
-    newest = {(entry.kind, entry.group): entry.resets_at for entry in current if entry.resets_at}
+    newest = {(entry.kind, entry.group, entry.scope): entry.resets_at for entry in current if entry.resets_at}
     return [
         entry
         for entry in previous
         if entry.resets_at
-        and (entry.resets_at <= now or entry.resets_at < newest.get((entry.kind, entry.group), entry.resets_at))
+        and (
+            entry.resets_at <= now
+            or entry.resets_at < newest.get((entry.kind, entry.group, entry.scope), entry.resets_at)
+        )
     ]
 
 

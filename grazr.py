@@ -28,7 +28,8 @@ import claude
 import core
 import stores
 
-Config = namedtuple("Config", "thresholds accounts enabled dry_run")
+# model_limits defaults off, so a Config built without it reads as before.
+Config = namedtuple("Config", "thresholds accounts enabled dry_run model_limits", defaults=(False,))
 
 Runtime = namedtuple("Runtime", "paths store state_dir config")
 
@@ -42,10 +43,11 @@ ACCOUNTS=""
 
 ENABLED=1
 DRY_RUN=0                # 1 = log the decision, do not swap
+MODEL_LIMITS=0           # 1 = also watch per-model weekly limits, from Claude's usage endpoint
 """
 
 _THRESHOLD_KEYS = {"REMAINING_SESSION": ("session", 15), "REMAINING_WEEKLY": ("weekly", 10)}
-_FLAG_KEYS = (("ENABLED", True), ("DRY_RUN", False))
+_FLAG_KEYS = (("ENABLED", True), ("DRY_RUN", False), ("MODEL_LIMITS", False))
 
 LOG = "grazr.log"
 PREVIOUS_STATUSLINE = "statusline.previous.json"
@@ -71,6 +73,15 @@ RATE_LIMIT_ERROR = "rate_limit"
 FAILURE_GRACE_SECONDS = 60
 # A rate limit with no window on record to pin it to.
 RATE_LIMIT_FALLBACK_SECONDS = 3600
+
+# MODEL_LIMITS: per-model weekly limits, read from Claude's usage endpoint.
+SCOPED_STATE = "scoped.json"        # {account id: unix time of the last request}
+SCOPED_LOCK = "scoped.lock"
+MODELS_SEEN = "models_seen.json"    # {"models": {display name: unix time}}
+# One request per active account per interval, whatever the number of panes.
+SCOPED_POLL_SECONDS = 120
+# A model counts as in use while a pane reported it this recently.
+MODEL_RECENT_SECONDS = 15 * 60
 
 TAG = "grazr"
 ESCAPE = "\x1b"
@@ -379,7 +390,10 @@ def load_config(path):
     if settings:
         raise ValueError("Unknown setting(s): %s" % ", ".join(sorted(settings)))
 
-    return Config(thresholds=thresholds, accounts=accounts, enabled=flags[0], dry_run=flags[1])
+    return Config(
+        thresholds=thresholds, accounts=accounts, enabled=flags[0], dry_run=flags[1],
+        model_limits=flags[2],
+    )
 
 
 def _seed_config(path):
@@ -488,6 +502,12 @@ def statusline(runtime=None, payload=None, spawn=subprocess.run, detach=None):
         _warn_unreadable(state_dir, payload)
         return 0
     _disarm_unreadable(state_dir, payload)
+    now = datetime.now(timezone.utc)
+    if config.model_limits:
+        try:
+            _note_model(state_dir, payload, now)
+        except Exception:  # noqa: BLE001 -- noting the model must never cost the bar
+            pass
     active = claude.active_account(paths)
     if active is None:
         _report_signed_out(state_dir)
@@ -495,13 +515,16 @@ def statusline(runtime=None, payload=None, spawn=subprocess.run, detach=None):
     enrolled = accounts.load(paths, [])
     if _left_behind(limits, active, enrolled):
         return 0
-    now = datetime.now(timezone.utc)
     _unblock_if_answering(state_dir, active, limits, enrolled, now)
     with _file_lock(os.path.join(state_dir, "readings.lock"), wait=True):
         previous = _latest_reading(paths, active)
         name = _name_of(enrolled, active)
         _log_leftovers(state_dir, now, name, core.replaced(previous, limits, now))
         limits = core.merged(previous, limits, now)
+        if not config.model_limits:
+            # Only the usage endpoint reports per-model limits, so with the
+            # setting off the last ones would linger; they go at once.
+            limits = [entry for entry in limits if entry.scope is None]
         # An idle pane repeats an old figure every minute, and a payload can
         # lack a window that ran out while the account was parked. Either can
         # be the first payload after a swap. Only a reading that lowers a
@@ -520,32 +543,160 @@ def statusline(runtime=None, payload=None, spawn=subprocess.run, detach=None):
             if expired:
                 _log_leftovers(state_dir, now, parked.name, expired)
                 accounts.record_snapshot(paths, parked.id, core.merged(parked.snapshot, [], now))
-    if not core.needs_rotation(limits, now, config.thresholds) and not core.expiring_sooner(
-        limits, active, _usable(state_dir, enrolled, active, now), now, config.thresholds
-    ):
+    # The status line never carries a per-model limit; merged() keeps the last
+    # one the usage endpoint gave, and it binds only while a pane is on that model.
+    models = _models_in_use(state_dir, now)
+    relevant = _relevant(limits, models)
+    rotate = core.needs_rotation(relevant, now, config.thresholds) or bool(core.expiring_sooner(
+        relevant, active, _bound(_usable(state_dir, enrolled, active, now), models), now, config.thresholds
+    ))
+    due = config.model_limits and _scoped_due(state_dir, store, active, now)
+    if not rotate and not due:
         return 0
     if not any(entry.id == active for entry in enrolled):
-        _report_unenrolled_active(state_dir, active)
+        if rotate:
+            _report_unenrolled_active(state_dir, active)
         return 0
     (detach or (lambda: _detach_decide(state_dir)))()
     return 0
 
 
+def _relevant(snapshot, models):
+    """A per-model limit binds only while some pane is using that model. An
+    account out of one model still serves every other, so running out of it
+    must not move a pane working on another."""
+    if not isinstance(snapshot, list):
+        return snapshot
+    # A substring, since the endpoint names a model "Fable" and the status line
+    # says "Fable 5.1 (1M context)".
+    return [
+        entry for entry in snapshot
+        if entry.scope is None
+        or any(str(entry.scope).lower() in model.lower() for model in models)
+    ]
+
+
+def _bound(enrolled, models):
+    """Accounts with only the windows that bind for the models in use."""
+    return [entry._replace(snapshot=_relevant(entry.snapshot, models)) for entry in enrolled]
+
+
+def _read_models_seen(state_dir):
+    try:
+        with open(os.path.join(state_dir, MODELS_SEEN)) as handle:
+            seen = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    models = seen.get("models") if isinstance(seen, dict) else None
+    if not isinstance(models, dict):
+        return {}
+    return {name: when for name, when in models.items() if isinstance(when, (int, float))}
+
+
+def _note_model(state_dir, payload, now):
+    """Remember which model a pane is on. Written at most once a minute per
+    model, since this runs on every message."""
+    try:
+        model = json.loads(payload).get("model") or {}
+        name = model.get("display_name") or model.get("id")
+    except (ValueError, AttributeError, TypeError):
+        return
+    if not isinstance(name, str) or not name:
+        return
+    models = _read_models_seen(state_dir)
+    stamp = now.timestamp()
+    if stamp - models.get(name, 0) < 60:
+        return
+    models[name] = stamp
+    models = {key: when for key, when in models.items() if stamp - when < 24 * 3600}
+    try:
+        atomic.write(os.path.join(state_dir, MODELS_SEEN), json.dumps({"models": models}))
+    except OSError:
+        pass
+
+
+def _models_in_use(state_dir, now):
+    stamp = now.timestamp()
+    return [
+        name for name, when in _read_models_seen(state_dir).items()
+        if stamp - when < MODEL_RECENT_SECONDS
+    ]
+
+
+def _read_scoped_state(state_dir):
+    try:
+        with open(os.path.join(state_dir, SCOPED_STATE)) as handle:
+            state = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    return state if isinstance(state, dict) else {}
+
+
+def _scoped_due(state_dir, store, active, now):
+    """A request is worth a detached process only once the last one for this
+    account is old enough, and only with a claude.ai login to ask with. The
+    interval is checked first: it is a file read, where the login can be a
+    keychain call the status line must not pay on every message."""
+    last = _read_scoped_state(state_dir).get(active)
+    if isinstance(last, (int, float)) and now.timestamp() - last < SCOPED_POLL_SECONDS:
+        return False
+    try:
+        return claude.access_token(store.read_live()) is not None
+    except Exception:  # noqa: BLE001 -- a keychain refusal must not cost the bar
+        return False
+
+
+def _refresh_scoped(runtime, now):
+    """Ask for the active login's per-model limits and keep them in its
+    snapshot. One process at a time, and a failure waits for the next
+    interval rather than asking again at once."""
+    paths, store, state_dir, config = runtime
+    if not config.model_limits:
+        return
+    active = claude.active_account(paths)
+    if active is None or not _scoped_due(state_dir, store, active, now):
+        return
+    with _file_lock(os.path.join(state_dir, SCOPED_LOCK)) as acquired:
+        if not acquired:
+            return
+        state = _read_scoped_state(state_dir)
+        state[active] = now.timestamp()
+        try:
+            atomic.write(os.path.join(state_dir, SCOPED_STATE), json.dumps(state))
+        except OSError:
+            return
+        scoped = claude.fetch_scoped_limits(store.read_live())
+        # A swap while the request was out makes the reply another account's.
+        if scoped is None or claude.active_account(paths) != active:
+            return
+        with _file_lock(os.path.join(state_dir, "readings.lock"), wait=True):
+            previous = _latest_reading(paths, active)
+            unscoped = [entry for entry in previous if entry.scope is None] if isinstance(previous, list) else []
+            accounts.record_snapshot(paths, active, unscoped + scoped)
+
+
 def _log_leftovers(state_dir, now, name, expired):
     for window in expired:
-        _log(state_dir, now, "%s %s window reset with %d%% left" % (name, window.group, window.remaining))
+        _log(state_dir, now, "%s %s window reset with %d%% left" % (name, _window_name(window), window.remaining))
+
+
+def _window_name(entry):
+    """"session", "weekly", or "Fable weekly" for a per-model one."""
+    return "%s %s" % (entry.scope, entry.group) if entry.scope else entry.group
 
 
 def _cost(parked, limits):
     """Each window before and after the first turn on the account, as in
     "session 100% -> 97%". A window not on record when parked was fresh."""
     before = {
-        (entry.kind, entry.group, entry.resets_at): entry.remaining
+        (entry.kind, entry.group, entry.scope, entry.resets_at): entry.remaining
         for entry in (parked if isinstance(parked, list) else [])
     }
     return ", ".join(
         "%s %d%% -> %d%%" % (
-            entry.group, before.get((entry.kind, entry.group, entry.resets_at), 100), entry.remaining
+            _window_name(entry),
+            before.get((entry.kind, entry.group, entry.scope, entry.resets_at), 100),
+            entry.remaining,
         )
         for entry in limits
     )
@@ -649,6 +800,10 @@ def decide(runtime=None):
     runtime = runtime or _runtime()
     paths, store, state_dir, config = runtime
     now = datetime.now(timezone.utc)
+    try:
+        _refresh_scoped(runtime, now)
+    except Exception as error:  # noqa: BLE001 -- the decision must still run
+        print("grazr: per-model reading failed: %s" % type(error).__name__, file=sys.stderr)
     with _rotation_lock(state_dir) as acquired:
         if not acquired:
             return 0
@@ -656,8 +811,9 @@ def decide(runtime=None):
         limits = _latest_reading(paths, active)
         if limits is None:
             return 0
-        enrolled = _usable(state_dir, accounts.load(paths, config.accounts), active, now)
-        decision = core.decide(limits, active, enrolled, now, config.thresholds)
+        models = _models_in_use(state_dir, now)
+        enrolled = _bound(_usable(state_dir, accounts.load(paths, config.accounts), active, now), models)
+        decision = core.decide(_relevant(limits, models), active, enrolled, now, config.thresholds)
         # rotate refuses this too, but a raised error suits the person who just
         # pressed a key, not every message of every pane.
         if isinstance(decision, tuple):
@@ -740,7 +896,10 @@ def recover(runtime=None, error=None, failed=None, now=None):
         else:
             _block(state_dir, active, error, limits, now)
             pinned = False
-        enrolled = _usable(state_dir, accounts.load(paths, config.accounts), active, now)
+        enrolled = _bound(
+            _usable(state_dir, accounts.load(paths, config.accounts), active, now),
+            _models_in_use(state_dir, now),
+        )
         decision = _after_failure(limits, active, enrolled, now, config.thresholds, pinned)
         if isinstance(decision, tuple):
             override = claude.settings_auth_override(paths.config_dir)
@@ -940,7 +1099,7 @@ def _left_behind(limits, active, enrolled):
     windows = {
         (entry.group, entry.resets_at.replace(microsecond=0)): entry.remaining
         for entry in limits
-        if entry.resets_at
+        if entry.resets_at and entry.scope is None
     }
     if not windows:
         return False
@@ -949,7 +1108,7 @@ def _left_behind(limits, active, enrolled):
         for entry in enrolled
         if entry.id == active and isinstance(entry.snapshot, list)
         for item in entry.snapshot
-        if item.resets_at
+        if item.resets_at and item.scope is None
     }
     could_be_active = not active_resets or bool(active_resets & set(windows))
     for entry in enrolled:
@@ -958,7 +1117,7 @@ def _left_behind(limits, active, enrolled):
         parked = {
             (item.group, item.resets_at.replace(microsecond=0)): item.remaining
             for item in entry.snapshot
-            if item.resets_at
+            if item.resets_at and item.scope is None
         }
         if not all(window in parked for window in windows):
             continue
@@ -1108,7 +1267,10 @@ def swap(runtime=None):
         if active is None:
             return _refuse_swap("Not logged in, nothing to swap from")
         limits = _latest_reading(paths, active)
-        enrolled = _usable(state_dir, accounts.load(paths, config.accounts), active, now)
+        enrolled = _bound(
+            _usable(state_dir, accounts.load(paths, config.accounts), active, now),
+            _models_in_use(state_dir, now),
+        )
         next_id = core.next_account(active, enrolled, now, config.thresholds)
         if next_id is None:
             # The account you are on is never a swap target, so its reset says
@@ -1206,7 +1368,8 @@ def _describe(snapshot):
     if snapshot is None:
         return "no reading yet"
     return ", ".join(
-        "%s %d%% left" % (entry.kind, entry.remaining) for entry in snapshot
+        "%s %d%% left" % ("%s weekly" % entry.scope if entry.scope else entry.kind, entry.remaining)
+        for entry in snapshot
     ) or "no limits reported"
 
 
