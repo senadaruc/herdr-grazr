@@ -27,6 +27,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   per-model limits, at most every two minutes. Such a limit counts only while
   a pane is on that model. It is off by default, since the endpoint is
   undocumented.
+- `grazr.py swap <account>` moves to the account you name, by name or id,
+  instead of the first one with headroom. It is the same swap the key makes,
+  with the same lock, toast, log and `DRY_RUN`. Any enrolled account can be
+  named, and its headroom is not consulted. An account the server refused is
+  not, until it is enrolled again.
 
 ## 0.4.7 - 2026-10-04
 
