@@ -4,6 +4,19 @@ Notable changes to *grazr*, newest first. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.4.9 - 2026-10-07
+
+### Fixed
+
+- A reading from the account just left can no longer land on the new one.
+  Until a session makes its next request it still reports the old account,
+  and grazr tells such a reading by reset times. When the new account had no
+  windows on record, because its week ran out while parked, the guard fell
+  back to the figures, and a reading one point under the parked copy passed
+  as the new account's. The result was a false "every account is low" toast
+  and two wrong leftover lines. Until the new account's first reading proves
+  it, a reading with the old account's windows is now the old account's.
+
 ## 0.4.8 - 2026-10-07
 
 ### Fixed
