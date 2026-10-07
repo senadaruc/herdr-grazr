@@ -473,7 +473,7 @@ def statusline(runtime=None, payload=None, spawn=subprocess.run, detach=None):
         _report_signed_out(state_dir)
         return 0
     enrolled = accounts.load(paths, [])
-    if _left_behind(limits, active, enrolled):
+    if _left_behind(limits, active, enrolled, accounts.first_reading_due(paths, active)):
         return 0
     now = datetime.now(timezone.utc)
     with _file_lock(os.path.join(state_dir, "readings.lock"), wait=True):
@@ -683,13 +683,16 @@ def _previous_bar(state_dir, payload, spawn):
         return ""
 
 
-def _left_behind(limits, active, enrolled):
+def _left_behind(limits, active, enrolled, unproven=False):
     """A session keeps reporting the account it left until its next request.
     Such a reading shows that account's windows, by reset time. When the active
     account's own windows reset at other times, that alone tells the reading is
     not its, whatever headroom it shows: the last message before the swap can
     tick the parked figure a shade lower. Headroom only decides it when the
-    active account could be the source, since two accounts can share a reset."""
+    active account could be the source, since two accounts can share a reset.
+    `unproven` says the active account's first reading since the swap is still
+    due: until then a reading with a parked account's windows is that account's,
+    since the active one may have no windows of its own on record to tell by."""
     windows = {
         (entry.group, entry.resets_at.replace(microsecond=0)): entry.remaining
         for entry in limits
@@ -704,7 +707,7 @@ def _left_behind(limits, active, enrolled):
         for item in entry.snapshot
         if item.resets_at
     }
-    could_be_active = not active_resets or bool(active_resets & set(windows))
+    could_be_active = not unproven and (not active_resets or bool(active_resets & set(windows)))
     for entry in enrolled:
         if entry.id == active or not isinstance(entry.snapshot, list):
             continue

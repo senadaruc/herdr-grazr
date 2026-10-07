@@ -2830,6 +2830,22 @@ class StatuslineTest(EnrolledPairFixture):
         with open(os.path.join(self.state_dir, "accounts", "uuid-work.json")) as handle:
             self.assertEqual((self.rotations, json.load(handle).get("snapshot")), ([], None))
 
+    def test_a_leftover_reading_is_ignored_even_when_the_new_account_has_no_record(self):
+        """An account whose record ran out while parked has no windows of its
+        own to tell a leftover reading by, and the leftover can be a point
+        under the parked copy. Until the new account's first reading proves
+        it, a reading with the old account's windows is the old account's."""
+        left_window = datetime.now(timezone.utc) + timedelta(hours=3)
+        self.run_statusline(self.payload(used=86, resets_at=int(left_window.timestamp())))
+        self.write_login("uuid-personal")
+
+        self.run_statusline(self.payload(used=87, resets_at=int(left_window.timestamp())))
+
+        with open(os.path.join(self.state_dir, "accounts", "uuid-personal.json")) as handle:
+            self.assertIsNone(json.load(handle).get("snapshot"))
+        with open(os.path.join(self.state_dir, "grazr.log")) as handle:
+            self.assertNotIn("First reading", handle.read())
+
     def test_a_leftover_reading_lower_than_when_it_was_parked_is_still_ignored(self):
         """A leftover reading can show a shade less than grazr parked, when the
         last message before the swap ticked the old account down. Its reset time
