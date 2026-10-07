@@ -186,6 +186,19 @@ USAGE_USER_AGENT = "grazr (+https://github.com/wazum/herdr-grazr)"
 def fetch_scoped_limits(blob, opener=urllib.request.urlopen):
     """Ask the usage endpoint for the login in `blob`. None on any failure: no
     token, an expired one, the network, an unexpected shape."""
+    reply = _fetch_usage(blob, opener)
+    return None if reply is None else scoped_limits(reply)
+
+
+def fetch_usage_limits(blob, opener=urllib.request.urlopen):
+    """Every window the usage endpoint reports for the login in `blob`, the
+    five-hour and all-models ones included: a parked account has no status
+    line to give them. None on any failure, like fetch_scoped_limits."""
+    reply = _fetch_usage(blob, opener)
+    return None if reply is None else usage_limits(reply)
+
+
+def _fetch_usage(blob, opener):
     token = access_token(blob)
     if token is None:
         return None
@@ -196,10 +209,104 @@ def fetch_scoped_limits(blob, opener=urllib.request.urlopen):
     })
     try:
         with opener(request, timeout=USAGE_TIMEOUT_SECONDS) as response:
-            reply = json.loads(response.read().decode("utf-8"))
+            return json.loads(response.read().decode("utf-8"))
     except (urllib.error.URLError, OSError, ValueError, UnicodeDecodeError):
         return None
-    return scoped_limits(reply)
+
+
+def usage_limits(reply):
+    """Every window in a usage reply: per-model ones as scoped_limits reads
+    them, the rest with no scope. None when the reply has no readable `limits`."""
+    scoped = scoped_limits(reply)
+    if scoped is None:
+        return None
+    unscoped = []
+    for entry in reply["limits"]:
+        try:
+            if entry.get("scope"):
+                continue
+            kind, group, percent = entry["kind"], entry["group"], entry["percent"]
+        except (AttributeError, KeyError, TypeError):
+            continue
+        if not isinstance(kind, str) or not isinstance(group, str):
+            continue
+        if not isinstance(percent, (int, float)) or isinstance(percent, bool):
+            continue
+        try:
+            resets_at = accounts.parse_time(entry.get("resets_at"))
+        except (TypeError, ValueError, AttributeError):
+            resets_at = None
+        unscoped.append(core.Limit(
+            kind=kind, scope=None, group=group, remaining=max(0, 100 - percent), resets_at=resets_at,
+        ))
+    return unscoped + scoped
+
+
+# PARKED_POLL_MINUTES: a parked account's own token, refreshed the way Claude
+# Code refreshes it (its 2.1.x client, endpoint and request body), so grazr can
+# read that account's usage while nothing runs on it. Only parked logins: the
+# live one belongs to Claude, which refreshes it itself.
+TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
+CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+TOKEN_TIMEOUT_SECONDS = 30
+# Refreshed this long before it lapses, so the usage request never races it.
+TOKEN_EXPIRY_MARGIN_MS = 5 * 60 * 1000
+
+
+def token_expired(blob, now_ms):
+    """Whether the login's access token has lapsed, or is about to. A blob with
+    no expiry on record reads as current: the request will say otherwise."""
+    try:
+        expires_at = json.loads(blob)["claudeAiOauth"].get("expiresAt")
+    except (TypeError, ValueError, KeyError, AttributeError):
+        return False
+    expires_at = _epoch_milliseconds(expires_at)
+    return expires_at is not None and expires_at - TOKEN_EXPIRY_MARGIN_MS <= now_ms
+
+
+def refreshed_login(blob, opener=urllib.request.urlopen, now_ms=None):
+    """`blob` with a new token pair, or None when there is no refresh token or
+    the server refuses. The refresh token rotates: once this returns, the old
+    one is spent, so the caller must store the result before anything else
+    reads the login."""
+    try:
+        login = json.loads(blob)
+        oauth = dict(login["claudeAiOauth"])
+    except (TypeError, ValueError, KeyError, AttributeError):
+        return None
+    refresh_token = oauth.get("refreshToken")
+    if not isinstance(refresh_token, str) or not refresh_token:
+        return None
+    body = {"grant_type": "refresh_token", "refresh_token": refresh_token, "client_id": CLIENT_ID}
+    scopes = oauth.get("scopes")
+    if isinstance(scopes, list) and scopes and all(isinstance(scope, str) for scope in scopes):
+        body["scope"] = " ".join(scopes)
+    request = urllib.request.Request(
+        TOKEN_URL,
+        data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json", "User-Agent": USAGE_USER_AGENT},
+        method="POST",
+    )
+    try:
+        with opener(request, timeout=TOKEN_TIMEOUT_SECONDS) as response:
+            reply = json.loads(response.read().decode("utf-8"))
+        access = reply["access_token"]
+    except (urllib.error.URLError, OSError, ValueError, UnicodeDecodeError, KeyError, TypeError):
+        return None
+    if not isinstance(access, str) or not access:
+        return None
+    now_ms = time.time() * 1000 if now_ms is None else now_ms
+    oauth["accessToken"] = access
+    if isinstance(reply.get("refresh_token"), str) and reply["refresh_token"]:
+        oauth["refreshToken"] = reply["refresh_token"]
+    expires_in = _epoch_milliseconds(reply.get("expires_in"))
+    if expires_in is not None:
+        oauth["expiresAt"] = int(now_ms + expires_in * 1000)
+    refresh_expires_in = _epoch_milliseconds(reply.get("refresh_token_expires_in"))
+    if refresh_expires_in is not None:
+        oauth["refreshTokenExpiresAt"] = int(now_ms + refresh_expires_in * 1000)
+    login["claudeAiOauth"] = oauth
+    return json.dumps(login)
 
 
 def _from_unix(seconds):

@@ -28,8 +28,12 @@ import claude
 import core
 import stores
 
-# model_limits defaults off, so a Config built without it reads as before.
-Config = namedtuple("Config", "thresholds accounts enabled dry_run model_limits", defaults=(False,))
+# model_limits and parked_poll_minutes default off, so a Config built without
+# them reads as before.
+Config = namedtuple(
+    "Config", "thresholds accounts enabled dry_run model_limits parked_poll_minutes",
+    defaults=(False, 0),
+)
 
 Runtime = namedtuple("Runtime", "paths store state_dir config")
 
@@ -44,6 +48,7 @@ ACCOUNTS=""
 ENABLED=1
 DRY_RUN=0                # 1 = log the decision, do not swap
 MODEL_LIMITS=0           # 1 = also watch per-model weekly limits, from Claude's usage endpoint
+PARKED_POLL_MINUTES=0    # re-read parked accounts' usage this often, refreshing their tokens; 0 = never
 """
 
 _THRESHOLD_KEYS = {"REMAINING_SESSION": ("session", 15), "REMAINING_WEEKLY": ("weekly", 10)}
@@ -82,6 +87,12 @@ MODELS_SEEN = "models_seen.json"    # {"models": {display name: unix time}}
 SCOPED_POLL_SECONDS = 120
 # A model counts as in use while a pane reported it this recently.
 MODEL_RECENT_SECONDS = 15 * 60
+
+# PARKED_POLL_MINUTES: a parked account's reading is otherwise frozen at the
+# moment grazr left it, so one that refilled, or whose limit the server lifted,
+# still reads as spent until its reset.
+PARKED_STATE = "parked.json"        # {"at": unix time of the last poll}
+PARKED_LOCK = "parked.lock"
 
 TAG = "grazr"
 ESCAPE = "\x1b"
@@ -404,6 +415,7 @@ def load_config(path):
     for key, (group, default) in _THRESHOLD_KEYS.items():
         thresholds[group] = _percent(settings.pop(key, None), key, default)
     flags = [_flag(settings.pop(key, None), key, default) for key, default in _FLAG_KEYS]
+    parked_poll_minutes = _minutes(settings.pop("PARKED_POLL_MINUTES", None), "PARKED_POLL_MINUTES")
     accounts = shlex.split(settings.pop("ACCOUNTS", "") or "")
     if len(set(accounts)) != len(accounts):
         raise ValueError("ACCOUNTS lists the same account twice: %s" % " ".join(accounts))
@@ -412,7 +424,7 @@ def load_config(path):
 
     return Config(
         thresholds=thresholds, accounts=accounts, enabled=flags[0], dry_run=flags[1],
-        model_limits=flags[2],
+        model_limits=flags[2], parked_poll_minutes=parked_poll_minutes,
     )
 
 
@@ -434,6 +446,18 @@ def _percent(value, key, default):
         raise ValueError("%s must be a whole percent, got %r" % (key, value))
     if not 0 <= number <= 100:
         raise ValueError("%s must be between 0 and 100, got %d" % (key, number))
+    return number
+
+
+def _minutes(value, key):
+    if value is None:
+        return 0
+    try:
+        number = int(value)
+    except ValueError:
+        raise ValueError("%s must be a whole number of minutes, got %r" % (key, value))
+    if number < 0:
+        raise ValueError("%s must be 0 or more, got %d" % (key, number))
     return number
 
 
@@ -695,6 +719,98 @@ def _refresh_scoped(runtime, now):
             accounts.record_snapshot(paths, active, unscoped + scoped)
 
 
+def _refresh_parked(runtime, now, force=False, include_active=False):
+    """Read every parked account's usage from the endpoint, refreshing a lapsed
+    token first, and lay it over that account's record. At most once per
+    PARKED_POLL_MINUTES unless `force`, and one process at a time. Returns
+    (name, limits or None) per account asked, for `grazr.py refresh`."""
+    paths, store, state_dir, config = runtime
+    if not force and not config.parked_poll_minutes:
+        return []
+    with _file_lock(os.path.join(state_dir, PARKED_LOCK)) as acquired:
+        if not acquired:
+            return []
+        last = _read_parked_state(state_dir).get("at")
+        if (not force and isinstance(last, (int, float))
+                and now.timestamp() - last < config.parked_poll_minutes * 60):
+            return []
+        atomic.write(os.path.join(state_dir, PARKED_STATE), json.dumps({"at": now.timestamp()}))
+        active = claude.active_account(paths)
+        report = []
+        for entry in accounts.load(paths, config.accounts):
+            if entry.id == active:
+                if not include_active:
+                    continue
+                # Claude's own login: read with it, never refresh it.
+                blob = store.read_live()
+            else:
+                blob = _current_parked_login(runtime, entry, now)
+            limits = claude.fetch_usage_limits(blob) if blob else None
+            if limits is not None:
+                if not config.model_limits:
+                    limits = [limit for limit in limits if limit.scope is None]
+                with _file_lock(os.path.join(state_dir, "readings.lock"), wait=True):
+                    previous = _latest_reading(paths, entry.id)
+                    accounts.record_snapshot(paths, entry.id, core.overwritten(previous, limits, now))
+            report.append((entry.name, limits))
+        return report
+
+
+def _read_parked_state(state_dir):
+    try:
+        with open(os.path.join(state_dir, PARKED_STATE)) as handle:
+            state = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    return state if isinstance(state, dict) else {}
+
+
+def _current_parked_login(runtime, entry, now):
+    """`entry`'s parked login with a usable access token, refreshing a lapsed
+    one, or None. A refresh spends the old refresh token, so it runs under the
+    rotation lock: no swap can read the parked login half way and install a
+    spent pair. Busy means a swap is under way, and this account waits for the
+    next poll."""
+    paths, store, state_dir, _ = runtime
+    blob = store.read_parked(entry.id)
+    now_ms = now.timestamp() * 1000
+    if blob is None or not claude.token_expired(blob, now_ms):
+        return blob
+    with _rotation_lock(state_dir) as acquired:
+        if not acquired:
+            return None
+        # Swapped in meanwhile: the login is Claude's now, and so is its refresh.
+        if claude.active_account(paths) == entry.id:
+            return None
+        blob = store.read_parked(entry.id)
+        if blob is None or not claude.token_expired(blob, now_ms):
+            return blob
+        fresh = claude.refreshed_login(blob)
+        if fresh is None:
+            _log(state_dir, now, "Could not refresh the parked token of %s" % entry.name)
+            return None
+        try:
+            store.write_parked(entry.id, fresh)
+        except (OSError, ValueError, RuntimeError) as error:
+            _log(
+                state_dir, now,
+                "Refreshed the parked token of %s but could not store it (%s). Enrol it again"
+                % (entry.name, error),
+            )
+            return None
+        return fresh
+
+
+def refresh(runtime=None):
+    """Read every account's usage now, the live one too, whatever the interval.
+    For a client that wants current numbers on demand."""
+    runtime = runtime or _runtime()
+    now = datetime.now(timezone.utc)
+    for name, limits in _refresh_parked(runtime, now, force=True, include_active=True):
+        print("%s: %s" % (name, "no reading" if limits is None else _describe(limits)))
+    return 0
+
+
 def _log_leftovers(state_dir, now, name, expired):
     for window in expired:
         _log(state_dir, now, "%s %s window reset with %d%% left" % (name, _window_name(window), window.remaining))
@@ -816,8 +932,20 @@ def _detach_decide(state_dir):
 
 def decide(runtime=None):
     """Swap if the latest reading says so. Runs detached from the status line
-    that recorded it, so Claude cancelling that cannot stop a swap half way."""
+    that recorded it, so Claude cancelling that cannot stop a swap half way.
+    The parked accounts are read afterwards, so their requests never hold up
+    a swap that is due now."""
     runtime = runtime or _runtime()
+    try:
+        return _decide(runtime)
+    finally:
+        try:
+            _refresh_parked(runtime, datetime.now(timezone.utc))
+        except Exception as error:  # noqa: BLE001 -- a detached step has no one to tell
+            print("grazr: parked reading failed: %s" % type(error).__name__, file=sys.stderr)
+
+
+def _decide(runtime):
     paths, store, state_dir, config = runtime
     now = datetime.now(timezone.utc)
     try:
@@ -1203,6 +1331,7 @@ def _dispatch(argv):
     entry_points = {
         "statusline": statusline, "decide": decide, "install": install, "uninstall": uninstall,
         "status": status, "enrol": enrol, "swap": swap, "tag": tag, "failure": failure,
+        "refresh": refresh,
     }
     command = argv[1] if len(argv) > 1 else ""
     if command == "recover" and len(argv) == 4:

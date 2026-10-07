@@ -49,6 +49,18 @@ def merged(previous, current, now):
     return _live(readings, now)
 
 
+def overwritten(previous, current, now):
+    """A reading straight from the usage endpoint, laid over the record. Unlike
+    merged(), each window it carries is taken as it comes, headroom put back
+    included: it is the server's own answer, not an idle pane repeating an old
+    status line. Windows it leaves out stay as they were."""
+    if not isinstance(previous, list):
+        return _live(current, now)
+    covered = {(entry.kind, entry.group, entry.scope) for entry in current}
+    kept = [entry for entry in previous if (entry.kind, entry.group, entry.scope) not in covered]
+    return _live(list(current) + kept, now)
+
+
 def moved(previous, current):
     """Whether `current` shows spending the record does not: a window lowered
     or a new one opened. A payload that merely lacks a window, or repeats one,

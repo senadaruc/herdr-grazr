@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+import urllib.error
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest import mock
@@ -4255,3 +4256,199 @@ class StatusNamesTheModelTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# PARKED_POLL_MINUTES: a parked account's reading used to freeze at the moment
+# grazr left it, so an account the server had refilled still read as spent.
+
+def _login(access="sk-ant-oat-old", refresh="rt-old", expires_at=None, **extra):
+    oauth = {"accessToken": access, "refreshToken": refresh,
+             "scopes": ["user:inference", "user:profile"], "subscriptionType": "team"}
+    if expires_at is not None:
+        oauth["expiresAt"] = expires_at
+    oauth.update(extra)
+    return json.dumps({"claudeAiOauth": oauth, "mcpOAuth": {"kept": True}})
+
+
+class _Reply:
+    def __init__(self, body):
+        self.body = json.dumps(body).encode("utf-8")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self):
+        return self.body
+
+
+class UsageLimitsParseTest(unittest.TestCase):
+    def test_every_window_is_read_the_unscoped_ones_without_a_scope(self):
+        reset = _model_reset()
+        limits = claude.usage_limits(_usage_reply(reset))
+
+        self.assertEqual(
+            sorted((entry.kind, entry.scope, entry.remaining) for entry in limits),
+            [("session", None, 92), ("weekly_all", None, 20), ("weekly_scoped", "Fable", 0)],
+        )
+
+
+class RefreshedLoginTest(unittest.TestCase):
+    def test_it_asks_like_claude_code_and_keeps_the_rest_of_the_login(self):
+        sent = []
+
+        def opener(request, timeout):
+            sent.append((request.full_url, request.get_method(), json.loads(request.data)))
+            return _Reply({"access_token": "sk-ant-oat-new", "refresh_token": "rt-new",
+                           "expires_in": 3600, "refresh_token_expires_in": 86400})
+
+        fresh = json.loads(claude.refreshed_login(_login(), opener=opener, now_ms=1_000_000))
+
+        self.assertEqual(sent, [(claude.TOKEN_URL, "POST", {
+            "grant_type": "refresh_token", "refresh_token": "rt-old",
+            "client_id": claude.CLIENT_ID, "scope": "user:inference user:profile",
+        })])
+        oauth = fresh["claudeAiOauth"]
+        self.assertEqual(
+            (oauth["accessToken"], oauth["refreshToken"], oauth["expiresAt"],
+             oauth["refreshTokenExpiresAt"], oauth["subscriptionType"], fresh["mcpOAuth"]),
+            ("sk-ant-oat-new", "rt-new", 1_000_000 + 3_600_000, 1_000_000 + 86_400_000, "team", {"kept": True}),
+        )
+
+    def test_a_refusal_is_none(self):
+        def opener(request, timeout):
+            raise urllib.error.HTTPError(request.full_url, 400, "invalid_grant", {}, None)
+
+        self.assertIsNone(claude.refreshed_login(_login(), opener=opener))
+
+    def test_no_refresh_token_means_no_request(self):
+        opened = []
+        self.assertIsNone(claude.refreshed_login(
+            _login(refresh=None), opener=lambda *a, **k: opened.append(a)
+        ))
+        self.assertEqual(opened, [])
+
+    def test_a_token_counts_as_lapsed_shortly_before_it_does(self):
+        now_ms = 10_000_000
+        self.assertTrue(claude.token_expired(_login(expires_at=now_ms - 1), now_ms))
+        self.assertTrue(claude.token_expired(_login(expires_at=now_ms + 60_000), now_ms))
+        self.assertFalse(claude.token_expired(_login(expires_at=now_ms + 3_600_000), now_ms))
+        self.assertFalse(claude.token_expired(_login(), now_ms))
+
+
+class OverwrittenTest(unittest.TestCase):
+    def test_the_servers_answer_puts_headroom_back_that_merged_would_keep_out(self):
+        reset = _model_reset()
+        now = datetime.now(timezone.utc)
+        stale = [_weekly(0, reset), _model_limit(54, reset)]
+
+        self.assertEqual(merged(stale, [_weekly(49, reset)], now)[0].remaining, 0)
+        self.assertEqual(
+            core.overwritten(stale, [_weekly(49, reset)], now),
+            [_weekly(49, reset), _model_limit(54, reset)],
+        )
+
+
+class ParkedPollFixture(EnrolledPairFixture):
+    """"work" is live, "personal" parked with a stale 0% week."""
+
+    def setUp(self):
+        super().setUp()
+        self.write_config('ACCOUNTS="work personal"\nMODEL_LIMITS=1\nPARKED_POLL_MINUTES=10\n')
+        self.reset = _model_reset()
+        self.store = FakeStore(live=LIVE_LOGIN, parked={"uuid-personal": _login(expires_at=9e15)})
+        path = os.path.join(self.state_dir, "accounts", "uuid-personal.json")
+        with open(path) as handle:
+            stored = json.load(handle)
+        stored["snapshot"] = accounts.snapshot_to_json([_weekly(0, self.reset)])
+        with open(path, "w") as handle:
+            json.dump(stored, handle)
+        self.asked = []
+        self.refreshed = []
+
+    def runtime(self):
+        return super().runtime()._replace(store=self.store)
+
+    def fetch(self, blob):
+        self.asked.append(claude.access_token(blob))
+        return [_weekly(49, self.reset), _model_limit(54, self.reset)]
+
+    def refresh_login(self, blob):
+        self.refreshed.append(json.loads(blob)["claudeAiOauth"]["refreshToken"])
+        return _login(access="sk-ant-oat-new", refresh="rt-new", expires_at=9e15)
+
+    def poll(self, entry=None):
+        with mock.patch.object(claude, "fetch_usage_limits", self.fetch), \
+                mock.patch.object(claude, "refreshed_login", self.refresh_login):
+            return self.invoke(entry or grazr.decide)
+
+    def stored(self, identifier="uuid-personal"):
+        with open(os.path.join(self.state_dir, "accounts", identifier + ".json")) as handle:
+            return {(e["kind"], e["scope"]): e["remaining"] for e in json.load(handle)["snapshot"]}
+
+
+class ParkedPollTest(ParkedPollFixture):
+    def test_a_parked_accounts_stale_week_is_replaced_by_the_servers(self):
+        self.poll()
+
+        self.assertEqual(self.stored(), {("weekly_all", None): 49, ("weekly_scoped", "Fable"): 54})
+        self.assertEqual(self.asked, ["sk-ant-oat-old"])
+
+    def test_the_live_account_is_left_to_its_status_line(self):
+        self.poll()
+
+        self.assertNotIn("sk-ant-oat-test", self.asked)
+
+    def test_once_per_interval(self):
+        self.poll()
+        self.poll()
+
+        self.assertEqual(self.asked, ["sk-ant-oat-old"])
+
+    def test_off_by_default(self):
+        self.write_config('ACCOUNTS="work personal"\nMODEL_LIMITS=1\n')
+
+        self.poll()
+
+        self.assertEqual(self.asked, [])
+
+    def test_a_lapsed_token_is_refreshed_and_stored_before_asking(self):
+        self.store.parked["uuid-personal"] = _login(expires_at=1)
+
+        self.poll()
+
+        self.assertEqual(self.refreshed, ["rt-old"])
+        self.assertEqual(json.loads(self.store.parked["uuid-personal"])["claudeAiOauth"]["refreshToken"], "rt-new")
+        self.assertEqual(self.asked, ["sk-ant-oat-new"])
+
+    def test_no_refresh_while_a_swap_holds_the_rotation_lock(self):
+        self.store.parked["uuid-personal"] = _login(expires_at=1)
+
+        with grazr._rotation_lock(self.state_dir):
+            self.poll(lambda runtime: grazr._refresh_parked(runtime, datetime.now(timezone.utc)))
+
+        self.assertEqual((self.refreshed, self.asked), ([], []))
+        self.assertEqual(self.stored(), {("weekly_all", None): 0})
+
+    def test_a_failed_refresh_leaves_the_login_and_the_reading_alone(self):
+        before = _login(expires_at=1)
+        self.store.parked["uuid-personal"] = before
+
+        with mock.patch.object(claude, "fetch_usage_limits", self.fetch), \
+                mock.patch.object(claude, "refreshed_login", lambda blob: None):
+            self.invoke(grazr.decide)
+
+        self.assertEqual((self.store.parked["uuid-personal"], self.asked), (before, []))
+        self.assertEqual(self.stored(), {("weekly_all", None): 0})
+
+    def test_the_refresh_command_reads_every_account_now_the_live_one_with_its_own_login(self):
+        self.write_config('ACCOUNTS="work personal"\nMODEL_LIMITS=1\n')
+
+        code, printed = self.poll(grazr.refresh)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(sorted(self.asked), ["sk-ant-oat-old", "sk-ant-oat-test"])
+        self.assertIn("personal: weekly_all 49% left", printed)
+        self.assertEqual(self.refreshed, [])

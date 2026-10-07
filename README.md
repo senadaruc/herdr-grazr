@@ -120,6 +120,7 @@ ACCOUNTS="work personal" # preference order, first with headroom wins
 ENABLED=1
 DRY_RUN=0                # 1 = log the decision, do not swap
 MODEL_LIMITS=0           # 1 = also watch per-model weekly limits (see below)
+PARKED_POLL_MINUTES=0    # re-read parked accounts this often (see below)
 ```
 
 *grazr* never moves back to an account just because it recovered. The one
@@ -200,6 +201,28 @@ finding per-model readings. And *grazr* learns an account's per-model headroom
 only while that account is live. It never refreshes a parked token to ask, so
 a swap can land on an account that is also out of that model, and *grazr*
 moves on after the next reading.
+
+## Parked accounts
+
+*grazr* reads an account's usage only from the status line of the account in
+use, so a parked account's reading freezes at the moment *grazr* left it. One
+the server has refilled, or whose limit was lifted, still reads as spent until
+its reset, and *grazr* will not move into it.
+
+`PARKED_POLL_MINUTES=10` fixes that. Every ten minutes, from the detached step
+that makes the swap and after it, *grazr* asks Claude's usage endpoint for each
+parked account with that account's own saved login, and takes the answer as it
+comes, headroom put back included. A parked access token that has lapsed is
+refreshed first, the way Claude Code refreshes it, and the new pair is stored
+straight back. The refresh token rotates, so the refresh runs under the
+rotation lock: no swap can read the parked login half way. The live account is
+never refreshed here; Claude owns that login. `grazr.py refresh` reads every
+account at once, the live one included, whatever the interval.
+
+It is off by default: the usage endpoint and the token request are Claude
+Code's own, undocumented, and a release can change them. A refresh that fails
+leaves the parked login as it was; one the server accepted but *grazr* could
+not store is logged, and that account has to be enrolled again.
 
 ## When the server refuses an account
 

@@ -4,6 +4,18 @@ Notable changes to *grazr*, newest first. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.4.7+senad.2 - 2026-10-07
+
+### Added
+
+- `PARKED_POLL_MINUTES` re-reads parked accounts. A parked account's reading
+  used to freeze at the moment *grazr* left it, so one the server had refilled
+  still read as spent and *grazr* would not move into it. Every that many
+  minutes *grazr* now asks Claude's usage endpoint for each parked account with
+  its own saved login, refreshing a lapsed token first (under the rotation
+  lock, since the refresh token rotates), and takes the answer as it comes.
+  `grazr.py refresh` reads every account at once. Off by default.
+
 ## 0.4.7+senad.1 - 2026-10-06
 
 senadaruc's fork of 0.4.7.
