@@ -709,14 +709,18 @@ def _refresh_scoped(runtime, now):
             atomic.write(os.path.join(state_dir, SCOPED_STATE), json.dumps(state))
         except OSError:
             return
-        scoped = claude.fetch_scoped_limits(store.read_live())
+        limits = claude.fetch_usage_limits(store.read_live())
         # A swap while the request was out makes the reply another account's.
-        if scoped is None or claude.active_account(paths) != active:
+        if limits is None or claude.active_account(paths) != active:
             return
         with _file_lock(os.path.join(state_dir, "readings.lock"), wait=True):
             previous = _latest_reading(paths, active)
             unscoped = [entry for entry in previous if entry.scope is None] if isinstance(previous, list) else []
-            accounts.record_snapshot(paths, active, unscoped + scoped)
+            # The server's own figures, laid over the record as they come. The
+            # status line's merge keeps a window's lowest reading, so a figure
+            # from before the server lifted a limit would otherwise read as
+            # spent until the reset. Model limits the reply no longer names go.
+            accounts.record_snapshot(paths, active, core.overwritten(unscoped, limits, now))
 
 
 def _refresh_parked(runtime, now, force=False, include_active=False):

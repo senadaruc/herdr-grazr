@@ -16,6 +16,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   lock, since the refresh token rotates), and takes the answer as it comes.
   `grazr.py refresh` reads every account at once. Off by default.
 
+### Fixed
+
+- A live account whose limit the server lifted no longer reads as spent until
+  its reset. The status line's merge keeps a window's lowest reading, so a 0%
+  from before stayed. With `MODEL_LIMITS=1` the two-minute usage request now
+  takes every window the server reports, not only the per-model ones, and lays
+  them over the record as they come.
+
 ## 0.4.7+senad.1 - 2026-10-06
 
 senadaruc's fork of 0.4.7.

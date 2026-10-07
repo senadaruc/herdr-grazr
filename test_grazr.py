@@ -4173,7 +4173,7 @@ class DecideAsksForModelLimitsTest(ModelLimitsFixture):
             asked.append(claude.access_token(blob))
             return claude.scoped_limits(_usage_reply(self.reset))
 
-        with mock.patch.object(claude, "fetch_scoped_limits", fake_fetch):
+        with mock.patch.object(claude, "fetch_usage_limits", fake_fetch):
             self.run_statusline(self.payload(model="Fable 5.1"))
 
         self.assertEqual(
@@ -4184,7 +4184,7 @@ class DecideAsksForModelLimitsTest(ModelLimitsFixture):
         self.write_snapshot("uuid-work", [_weekly(50, self.reset)])
         asked = []
 
-        with mock.patch.object(claude, "fetch_scoped_limits", lambda blob: asked.append(1) or []):
+        with mock.patch.object(claude, "fetch_usage_limits", lambda blob: asked.append(1) or []):
             self.run_statusline(self.payload())
             self.run_statusline(self.payload())
 
@@ -4193,7 +4193,7 @@ class DecideAsksForModelLimitsTest(ModelLimitsFixture):
     def test_a_failed_request_changes_nothing(self):
         self.write_snapshot("uuid-work", [_weekly(50, self.reset)])
 
-        with mock.patch.object(claude, "fetch_scoped_limits", lambda blob: None):
+        with mock.patch.object(claude, "fetch_usage_limits", lambda blob: None):
             self.run_statusline(self.payload(model="Fable 5.1"))
 
         self.assertEqual(
@@ -4217,10 +4217,28 @@ class DecideAsksForModelLimitsTest(ModelLimitsFixture):
         self.write_snapshot("uuid-work", [_weekly(50, self.reset)])
         asked = []
 
-        with mock.patch.object(claude, "fetch_scoped_limits", lambda blob: asked.append(1) or []):
+        with mock.patch.object(claude, "fetch_usage_limits", lambda blob: asked.append(1) or []):
             self.run_statusline(self.payload(model="Fable 5.1"))
 
         self.assertEqual(asked, [])
+
+
+class LivePollPutsHeadroomBackTest(ModelLimitsFixture):
+    def runtime(self):
+        return super().runtime()._replace(store=FakeStore(live=LIVE_LOGIN))
+
+    def test_the_live_accounts_stale_spent_week_takes_the_servers_figure(self):
+        """The server lifted the limit: the status line's merge alone would
+        keep the 0% until the week resets."""
+        self.write_snapshot("uuid-work", [_weekly(0, self.reset), _model_limit(54, self.reset)])
+
+        with mock.patch.object(
+            claude, "fetch_usage_limits", lambda blob: [_weekly(46, self.reset), _model_limit(49, self.reset)]
+        ):
+            grazr._refresh_scoped(self.runtime(), datetime.now(timezone.utc))
+
+        stored = {(e["kind"], e["scope"]): e["remaining"] for e in self.snapshot_of("uuid-work")}
+        self.assertEqual(stored, {("weekly_all", None): 46, ("weekly_scoped", "Fable"): 49})
 
 
 class ManualSwapSkipsSpentModelTest(ModelLimitsFixture):
