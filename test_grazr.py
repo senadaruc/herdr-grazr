@@ -4398,9 +4398,12 @@ class ParkedPollFixture(EnrolledPairFixture):
         return _login(access="sk-ant-oat-new", refresh="rt-new", expires_at=9e15)
 
     def poll(self, entry=None):
+        """The parked poll on its own, unless another entry point is given:
+        decide also runs the live account's MODEL_LIMITS request."""
+        entry = entry or (lambda runtime: grazr._refresh_parked(runtime, datetime.now(timezone.utc)))
         with mock.patch.object(claude, "fetch_usage_limits", self.fetch), \
                 mock.patch.object(claude, "refreshed_login", self.refresh_login):
-            return self.invoke(entry or grazr.decide)
+            return self.invoke(entry)
 
     def stored(self, identifier="uuid-personal"):
         with open(os.path.join(self.state_dir, "accounts", identifier + ".json")) as handle:
@@ -4413,6 +4416,12 @@ class ParkedPollTest(ParkedPollFixture):
 
         self.assertEqual(self.stored(), {("weekly_all", None): 49, ("weekly_scoped", "Fable"): 54})
         self.assertEqual(self.asked, ["sk-ant-oat-old"])
+
+    def test_the_detached_decide_step_runs_it(self):
+        self.poll(grazr.decide)
+
+        self.assertIn("sk-ant-oat-old", self.asked)
+        self.assertEqual(self.stored()[("weekly_all", None)], 49)
 
     def test_the_live_account_is_left_to_its_status_line(self):
         self.poll()
@@ -4456,7 +4465,7 @@ class ParkedPollTest(ParkedPollFixture):
 
         with mock.patch.object(claude, "fetch_usage_limits", self.fetch), \
                 mock.patch.object(claude, "refreshed_login", lambda blob: None):
-            self.invoke(grazr.decide)
+            self.invoke(lambda runtime: grazr._refresh_parked(runtime, datetime.now(timezone.utc)))
 
         self.assertEqual((self.store.parked["uuid-personal"], self.asked), (before, []))
         self.assertEqual(self.stored(), {("weekly_all", None): 0})
