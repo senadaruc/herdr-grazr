@@ -4,6 +4,21 @@ Notable changes to *grazr*, newest first. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.4.8 - 2026-10-07
+
+### Fixed
+
+- MCP logins survive a swap at any size. The credential now goes to the
+  macOS `security` tool as a hex argument, the way Claude Code writes it,
+  instead of through the tool's interactive line, which truncates past 4095
+  bytes. With a few MCP servers the carry no longer fit, and 0.4.7 then
+  installed the arriving credential without them, silently. Issue 6.
+
+### Removed
+
+- The refusal to write a credential that does not fit the interactive line.
+  Nothing is measured against it any more.
+
 ## 0.4.7 - 2026-10-04
 
 ### Fixed
