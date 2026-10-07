@@ -230,13 +230,7 @@ def rotate(paths, store, active_id, next_id, snapshot):
             _write_swap_marker(paths, active_id, next_id, parking)
             store.write_parked(active_id, parking)
             renew()
-            try:
-                store.write_live(_carry_shared_keys(arriving, leaving))
-            except ValueError:
-                # The store refuses a blob past its line length, and the carry
-                # is what pushes it over. Losing the MCP logins beats leaving
-                # the pane on a spent account.
-                store.write_live(arriving)
+            store.write_live(_carry_shared_keys(arriving, leaving))
             renew()
         elif pending["next"] != next_id:
             _merge_oauth_account(

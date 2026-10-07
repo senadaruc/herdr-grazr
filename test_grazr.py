@@ -46,21 +46,17 @@ def account_named(name, identifier, snapshot=None):
 
 
 class FakeStore:
-    def __init__(self, live=None, parked=None, isolated=None, refuse_over=None):
+    def __init__(self, live=None, parked=None, isolated=None):
         self.live = live
         self.parked = dict(parked or {})
         self.isolated = dict(isolated or {})
         self.events = []
         self.discard_result = True
-        # The keychain is the one store that refuses a blob for being too long.
-        self.refuse_over = refuse_over
 
     def read_live(self):
         return self.live
 
     def write_live(self, blob):
-        if self.refuse_over is not None and len(blob) > self.refuse_over:
-            raise ValueError("credential needs a longer security line than allowed")
         self.events.append(("write_live", blob))
         self.live = blob
 
@@ -441,21 +437,19 @@ class KeychainStoreTest(unittest.TestCase):
             ],
         )
 
-    def test_write_live_feeds_security_i_a_quoted_hex_line(self):
+    def test_write_live_hands_security_the_live_service_and_a_hex_payload(self):
         recorded = {}
 
-        def fake_subprocess(argv, input, capture_output, text, **kwargs):
+        def fake_subprocess(argv, capture_output, text, **kwargs):
             recorded["argv"] = argv
-            recorded["line"] = input
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
         self.store(fake_subprocess).write_live('{"token":"abc"}')
 
-        self.assertEqual(recorded["argv"], [stores.SECURITY_BIN, "-i"])
         self.assertEqual(
-            recorded["line"],
-            "add-generic-password -U -s 'Claude Code-credentials' -a tester -X %s\n"
-            % '{"token":"abc"}'.encode().hex(),
+            recorded["argv"],
+            [stores.SECURITY_BIN, "add-generic-password", "-U", "-s", "Claude Code-credentials",
+             "-a", "tester", "-X", '{"token":"abc"}'.encode().hex()],
         )
 
     def test_a_parked_credential_lives_under_the_account_s_own_service(self):
@@ -463,10 +457,9 @@ class KeychainStoreTest(unittest.TestCase):
         may park under a filename instead, and no caller may care."""
         keychain = {}
 
-        def fake_subprocess(argv, input=None, capture_output=True, text=True, **kwargs):
-            if argv[:2] == [stores.SECURITY_BIN, "-i"]:
-                service = shlex.split(input)[3]
-                keychain[service] = shlex.split(input)[7]
+        def fake_subprocess(argv, capture_output=True, text=True, **kwargs):
+            if argv[1] == "add-generic-password":
+                keychain[argv[argv.index("-s") + 1]] = argv[argv.index("-X") + 1]
                 return SimpleNamespace(returncode=0, stdout="", stderr="")
             service = argv[argv.index("-s") + 1]
             if service not in keychain:
@@ -628,25 +621,19 @@ class HasParkedCredentialTest(unittest.TestCase):
 
 
 class CredentialInstallTest(unittest.TestCase):
-    """`security -i` truncates past 4095 bytes and writes the truncated prefix
-    over the item before it fails, so the refusal has to happen before the call."""
+    """The secret goes to `security` as a hex argument, the way Claude Code
+    itself writes the item. Its interactive line truncates past 4095 bytes and
+    destroys the item, which is what kept a login with many MCP servers from
+    ever being installed whole."""
 
     def install(self, service, account, blob, attempted):
-        def recording_spawn(argv, input, capture_output, text, **kwargs):
-            attempted.append(input.rstrip("\n"))
+        def recording_spawn(argv, capture_output, text, **kwargs):
+            attempted.append(argv)
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
         stores.KeychainStore(service, account, spawn=recording_spawn).write_live(blob)
 
-    def test_refuses_an_oversized_blob_without_invoking_security(self):
-        attempted = []
-
-        with self.assertRaises(ValueError):
-            self.install("svc", "acct", "x" * 2100, attempted)
-
-        self.assertEqual(attempted, [])
-
-    def test_a_blob_that_fits_is_installed_as_hex_never_as_plaintext(self):
+    def test_a_blob_is_installed_as_a_hex_argument_never_as_plaintext(self):
         blob = '{"claudeAiOauth":{"accessToken":"secret-value"}}'
         attempted = []
 
@@ -654,92 +641,53 @@ class CredentialInstallTest(unittest.TestCase):
 
         self.assertEqual(
             attempted,
-            ["add-generic-password -U -s svc -a acct -X " + blob.encode().hex()],
+            [[stores.SECURITY_BIN, "add-generic-password", "-U", "-s", "svc", "-a", "acct",
+              "-X", blob.encode().hex()]],
         )
-        self.assertNotIn("secret-value", attempted[0])
+        self.assertNotIn("secret-value", " ".join(attempted[0]))
 
-    def test_the_ceiling_is_the_measured_4095_bytes(self):
-        """Measured against the real binary: a 4095 byte line installs, 4096
-        truncates the item destructively. The newline is not counted."""
-        self.assertEqual(stores.MAX_SECURITY_LINE, 4095)
+    def test_a_blob_far_past_the_old_line_limit_is_installed_whole(self):
+        """Four MCP servers make a 3 KB credential, 6 KB as hex."""
+        blob = "x" * 6000
+        attempted = []
 
-    def test_a_line_of_exactly_the_ceiling_installs_and_one_byte_more_refuses(self):
-        """4095 installs. 4096 truncates the item destructively, verified
-        against the real binary. Each blob byte adds two hex characters, so the
-        account name carries the parity that makes both values reachable."""
-        service = "svcx"
-        for account, expected in (("acct", 4095), ("acctx", 4096)):
-            prefix = len("add-generic-password -U -s %s -a %s -X " % (service, account))
-            blob = "x" * ((stores.MAX_SECURITY_LINE + 1 - prefix) // 2)
-            line = "add-generic-password -U -s %s -a %s -X %s" % (
-                service,
-                account,
-                blob.encode().hex(),
-            )
-            self.assertEqual(len(line), expected, "fixture must land on %d" % expected)
+        self.install("svc", "acct", blob, attempted)
 
-            attempted = []
-            if expected <= stores.MAX_SECURITY_LINE:
-                self.install(service, account, blob, attempted)
-                self.assertEqual(len(attempted[0]), stores.MAX_SECURITY_LINE)
-            else:
-                with self.assertRaises(ValueError):
-                    self.install(service, account, blob, attempted)
-                self.assertEqual(attempted, [])
+        self.assertEqual(attempted[0][-1], blob.encode().hex())
 
-    def test_the_real_service_name_survives_the_interactive_parser(self):
-        """`security -i` splits its line into tokens, and the live service name
-        contains a space. Unquoted, `-s Claude Code-credentials` parses as
-        `-s Claude` plus a stray argument."""
+    def test_the_real_service_name_is_one_argument(self):
+        """The live service name contains a space. As one argv entry it needs
+        no quoting, and no parser can split it."""
         attempted = []
 
         self.install(stores.SERVICE, "some user", "x", attempted)
 
-        self.assertEqual(
-            shlex.split(attempted[0])[:6],
-            ["add-generic-password", "-U", "-s", "Claude Code-credentials", "-a", "some user"],
-        )
-
-    def test_the_budget_is_measured_in_bytes_not_characters(self):
-        """`security` counts bytes. A multi-byte account name fits the character
-        budget while overflowing the real one, and overflow destroys the item."""
-        account = "ü" * 20
-        prefix = len("add-generic-password -U -s svc -a %s -X " % shlex.quote(account))
-        # One character under, so only a byte-aware gate refuses it.
-        blob = "x" * ((stores.MAX_SECURITY_LINE - prefix) // 2 - 1)
-        line = "add-generic-password -U -s svc -a %s -X %s" % (account, blob.encode().hex())
-        self.assertLessEqual(len(line), stores.MAX_SECURITY_LINE, "fixture must fit in characters")
-        self.assertGreater(len(line.encode()), stores.MAX_SECURITY_LINE, "but not in bytes")
-        attempted = []
-
-        with self.assertRaises(ValueError):
-            self.install("svc", account, blob, attempted)
-
-        self.assertEqual(attempted, [])
+        self.assertEqual(attempted[0][2:7], ["-U", "-s", "Claude Code-credentials", "-a", "some user"])
 
 
 class SecurityRunnerTest(unittest.TestCase):
     def store(self, spawn):
         return stores.KeychainStore("svc", "acct", spawn=spawn)
 
-    def test_the_secret_travels_on_stdin_and_never_on_argv(self):
+    def test_the_secret_travels_as_hex_and_nothing_goes_to_stdin(self):
+        """The tool's own binary is called directly, so no shell ever sees the
+        argument, and nothing is left to be fed to an interactive prompt."""
         recorded = {}
 
-        def fake_subprocess(argv, input, capture_output, text, **kwargs):
+        def fake_subprocess(argv, capture_output, text, **kwargs):
             recorded["argv"] = argv
-            recorded["input"] = input
+            recorded["input"] = kwargs.get("input")
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
         self.store(fake_subprocess).write_live("secret-blob")
 
-        self.assertEqual(recorded["argv"], [stores.SECURITY_BIN, "-i"])
-        self.assertIn("secret-blob".encode().hex(), recorded["input"])
-        self.assertNotIn("secret-blob".encode().hex(), " ".join(recorded["argv"]))
-        # Without the newline `security -i` exits 0 having written nothing.
-        self.assertTrue(recorded["input"].endswith("\n"))
+        self.assertEqual(recorded["argv"][0], stores.SECURITY_BIN)
+        self.assertIn("secret-blob".encode().hex(), recorded["argv"])
+        self.assertNotIn("secret-blob", " ".join(recorded["argv"]))
+        self.assertIsNone(recorded["input"])
 
     def test_a_failing_security_call_raises_rather_than_passing_silently(self):
-        def fake_subprocess(argv, input, capture_output, text, **kwargs):
+        def fake_subprocess(argv, capture_output, text, **kwargs):
             return SimpleNamespace(returncode=1, stdout="", stderr="security: unknown command")
 
         with self.assertRaises(RuntimeError):
@@ -785,11 +733,11 @@ class SecurityRunnerTest(unittest.TestCase):
         self.assertNotIn("88888888", str(raised.exception))
 
     def test_the_failure_message_carries_no_credential_hex(self):
-        """On the truncation path security echoes the tail of the blob as its
+        """A failing security call can echo part of the hex payload in its
         error. That message reaches the plugin log, so it must not be repeated."""
         leaked = "security: unknown command \"%s\"" % ("87" * 40)
 
-        def fake_subprocess(argv, input, capture_output, text, **kwargs):
+        def fake_subprocess(argv, capture_output, text, **kwargs):
             return SimpleNamespace(returncode=1, stdout="", stderr=leaked)
 
         with self.assertRaises(RuntimeError) as raised:
@@ -1197,24 +1145,6 @@ class RotateTest(unittest.TestCase):
 
                 self.assertEqual(self.store.events, [])
                 self.assertEqual(self.store.live, "LIVE-WORK")
-
-    def test_a_carry_too_big_for_the_store_still_completes_the_swap(self):
-        """The keychain refuses a credential past its line length rather than
-        truncating it, and carrying the MCP logins is what can push it over.
-        Losing them beats leaving the pane on a spent account."""
-        self.store.live = json.dumps(
-            {
-                "claudeAiOauth": {"accessToken": "work-token"},
-                "mcpOAuth": {"linear": {"accessToken": "x" * 200}},
-            }
-        )
-        arriving = json.dumps({"claudeAiOauth": {"accessToken": "personal-token"}})
-        self.store.parked["uuid-personal"] = arriving
-        self.store.refuse_over = len(arriving)
-
-        self.run_rotate()
-
-        self.assertEqual(self.store.live, arriving)
 
     def test_the_mcp_logins_are_not_parked(self):
         """A parked copy of them is never read, since the carry takes the live

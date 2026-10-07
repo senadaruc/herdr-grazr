@@ -8,7 +8,6 @@ import hashlib
 import os
 import platform
 import re
-import shlex
 import subprocess
 import unicodedata
 
@@ -23,10 +22,6 @@ SERVICE = "Claude Code-credentials"
 # grant to, which is why grazr shells out here rather than linking a framework:
 # a grant against a rebuilt binary of our own would die at the next build.
 SECURITY_BIN = "/usr/bin/security"
-
-# At 4096 security truncates the line, writes the truncated prefix over the
-# item, and only then exits 1.
-MAX_SECURITY_LINE = 4095
 
 # A swap makes three keychain calls. All three at full timeout must still fit
 # inside the lock stale ages claude.py mirrors.
@@ -187,28 +182,18 @@ class KeychainStore:
             return stored
 
     def _install(self, service, blob):
-        # `security -i` splits its line into tokens and the live service name
-        # has a space, so the names need quoting. The hex payload never does.
-        line = "add-generic-password -U -s %s -a %s -X %s" % (
-            shlex.quote(service),
-            shlex.quote(self.keychain_account),
-            blob.encode().hex(),
-        )
-        size = len(line.encode())
-        if size > MAX_SECURITY_LINE:
-            raise ValueError(
-                "The credential for %s needs a %d byte security line, over the %d byte limit. "
-                "Installing it would truncate and destroy the item"
-                % (service, size, MAX_SECURITY_LINE)
-            )
-        self._run_security(line)
-
-    def _run_security(self, line):
-        """Feed one command to `security -i`. The secret rides stdin, argv stays clean."""
+        """The secret goes as a hex argument, the way Claude Code writes the
+        item itself. The tool's interactive line truncates past 4095 bytes and
+        destroys the item, so a login with many MCP servers never fit through
+        it. An argument has no such limit, and the secret shows in the process
+        list only for the moment the tool runs, as it does on every login and
+        token refresh Claude makes."""
         try:
             completed = self._spawn(
-                [SECURITY_BIN, "-i"],
-                input=line + "\n",
+                [
+                    SECURITY_BIN, "add-generic-password", "-U",
+                    "-s", service, "-a", self.keychain_account, "-X", blob.encode().hex(),
+                ],
                 capture_output=True,
                 text=True,
                 timeout=SECURITY_TIMEOUT_SECONDS,

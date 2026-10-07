@@ -263,9 +263,6 @@ because repainting one can jump it to the bottom.
 - Touch a pane that already hit the wall. *grazr* swaps before that. If a pane
   does show a limit, press `Esc` and send again, and it goes out on the new
   account.
-- Write a credential it cannot write whole. macOS `security` quietly truncates
-  an over-long input and destroys the item, so *grazr* measures first and
-  refuses.
 
 ## Policy
 
