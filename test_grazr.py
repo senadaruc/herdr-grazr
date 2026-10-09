@@ -4413,6 +4413,15 @@ class ShimTest(unittest.TestCase):
 
         self.assertEqual((environ[pins.ENV_TOKEN], self.read), ("mine", []))
 
+    def test_a_warning_is_also_a_herdr_toast_since_claude_clears_the_screen(self):
+        spawned = []
+
+        self.shim.toast("no token", {"HERDR_BIN_PATH": "/bin/herdr"}, spawn=lambda argv, **k: spawned.append(argv))
+        self.shim.toast("no token", {}, spawn=lambda argv, **k: spawned.append(argv))
+
+        self.assertEqual(spawned, [["/bin/herdr", "notification", "show", "grazr: pin not applied",
+                                    "--body", "no token", "--sound", "request"]])
+
     def test_the_real_claude_is_the_next_one_on_path(self):
         here = os.path.join(self.state, "bin")
         elsewhere = os.path.join(self.state, "real")

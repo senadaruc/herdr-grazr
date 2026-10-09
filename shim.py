@@ -13,6 +13,7 @@ unchanged: the shim must never be the reason Claude does not start.
 
 import getpass
 import os
+import subprocess
 import sys
 import time
 
@@ -73,6 +74,22 @@ def _read_token(state, account):
     return token.strip() if token else None
 
 
+def toast(warning, environ, spawn=subprocess.Popen):
+    """Claude clears the screen as it starts, so a warning on stderr is gone
+    before anyone reads it. Herdr's toast stays; never waited on."""
+    herdr = environ.get("HERDR_BIN_PATH")
+    if not herdr:
+        return
+    try:
+        spawn(
+            [herdr, "notification", "show", "grazr: pin not applied", "--body", warning, "--sound", "request"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError:
+        pass
+
+
 def main(argv):
     real = real_claude(os.environ.get("PATH", ""))
     if real is None:
@@ -84,6 +101,7 @@ def main(argv):
         environ, warning = dict(os.environ), "grazr: the pin could not be read (%s)" % type(error).__name__
     if warning:
         print(warning, file=sys.stderr)
+        toast(warning.replace("grazr: ", "", 1), os.environ)
     os.execve(real, [real] + argv[1:], environ)
 
 
