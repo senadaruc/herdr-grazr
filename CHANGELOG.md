@@ -4,6 +4,23 @@ Notable changes to *grazr*, newest first. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.4.7+senad.3 - 2026-10-09
+
+### Added
+
+- Pin an agent to an account. `grazr.py pin <pane> <account>` binds one Herdr
+  pane to one enrolled account, and Claude there runs on that account's own
+  long-lived token (`claude setup-token`, stored with `grazr.py token
+  <account>` in the keychain on macOS or a 0600 file on Linux) instead of the
+  shared login. It never rotates; *grazr* records its readings under its own
+  account and says when it runs low. The `pins-install` action puts a `claude`
+  shim first on PATH in Herdr panes only, so the pin holds across a Herdr
+  restart and a `claude --resume`. With anything missing the shim starts the
+  real Claude unchanged.
+- `PINNED_ROTATION=exclude|keep` (default `exclude`): whether the shared
+  rotation may still move to an account an agent is pinned to. `grazr.py set
+  PINNED_ROTATION keep` changes it in place.
+
 ## 0.4.7+senad.2 - 2026-10-07
 
 ### Added

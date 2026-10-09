@@ -26,13 +26,14 @@ import accounts
 import atomic
 import claude
 import core
+import pins
 import stores
 
-# model_limits and parked_poll_minutes default off, so a Config built without
-# them reads as before.
+# model_limits and parked_poll_minutes default off, and pinned_rotation to
+# exclude, so a Config built without them reads as before.
 Config = namedtuple(
-    "Config", "thresholds accounts enabled dry_run model_limits parked_poll_minutes",
-    defaults=(False, 0),
+    "Config", "thresholds accounts enabled dry_run model_limits parked_poll_minutes pinned_rotation",
+    defaults=(False, 0, pins.EXCLUDE),
 )
 
 Runtime = namedtuple("Runtime", "paths store state_dir config")
@@ -49,6 +50,7 @@ ENABLED=1
 DRY_RUN=0                # 1 = log the decision, do not swap
 MODEL_LIMITS=0           # 1 = also watch per-model weekly limits, from Claude's usage endpoint
 PARKED_POLL_MINUTES=0    # re-read parked accounts' usage this often, refreshing their tokens; 0 = never
+PINNED_ROTATION=exclude  # exclude = an account pinned to an agent is never rotated to; keep = it still is
 """
 
 _THRESHOLD_KEYS = {"REMAINING_SESSION": ("session", 15), "REMAINING_WEEKLY": ("weekly", 10)}
@@ -155,16 +157,20 @@ def notify(title, body, spawn=subprocess.run):
         return False
 
 
-def tag_all(name, spawn=subprocess.run):
-    """Publish the active account to every Claude pane as the `$grazr` token.
+def tag_all(name, spawn=subprocess.run, pinned=None):
+    """Publish the active account to every Claude pane as the `$grazr` token,
+    and to a pinned pane the account it is pinned to (`pinned`, {pane id:
+    label}), since a rotation never moves that one.
 
     Herdr shows it only where the user's own sidebar row names `$grazr`, so
     without that row nothing appears. Best-effort: a tag is never worth
     failing a rotation over.
     """
+    pinned = pinned or {}
     for pane_id, tokens in _claude_panes(spawn):
-        if tokens.get(TAG) != name:
-            tag_pane(pane_id, name, spawn)
+        wanted = pinned.get(pane_id, name)
+        if wanted and tokens.get(TAG) != wanted:
+            tag_pane(pane_id, wanted, spawn)
 
 
 def tag_pane(pane_id, name, spawn=subprocess.run):
@@ -190,6 +196,23 @@ def _claude_panes(spawn):
         for entry in agents
         if isinstance(entry, dict) and entry.get("agent") == "claude" and entry.get("pane_id")
     ]
+
+
+def _live_panes(spawn=subprocess.run):
+    """Every pane id Herdr knows, or None when it could not say."""
+    answer = _herdr(spawn, "pane", "list")
+    try:
+        return [entry["pane_id"] for entry in json.loads(answer)["result"]["panes"]]
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _pinned_labels(state_dir, enrolled):
+    """{pane id: tag} for the panes Claude runs pinned in."""
+    return {
+        pane: pins.label(_name_of(enrolled, account))
+        for pane, account in pins.running_on(state_dir).items()
+    }
 
 
 def _is_scrolled(pane_id, spawn):
@@ -416,6 +439,9 @@ def load_config(path):
         thresholds[group] = _percent(settings.pop(key, None), key, default)
     flags = [_flag(settings.pop(key, None), key, default) for key, default in _FLAG_KEYS]
     parked_poll_minutes = _minutes(settings.pop("PARKED_POLL_MINUTES", None), "PARKED_POLL_MINUTES")
+    pinned_rotation = settings.pop("PINNED_ROTATION", None) or pins.EXCLUDE
+    if pinned_rotation not in pins.ROTATION_MODES:
+        raise ValueError("PINNED_ROTATION must be %s, got %r" % (" or ".join(pins.ROTATION_MODES), pinned_rotation))
     accounts = shlex.split(settings.pop("ACCOUNTS", "") or "")
     if len(set(accounts)) != len(accounts):
         raise ValueError("ACCOUNTS lists the same account twice: %s" % " ".join(accounts))
@@ -425,6 +451,7 @@ def load_config(path):
     return Config(
         thresholds=thresholds, accounts=accounts, enabled=flags[0], dry_run=flags[1],
         model_limits=flags[2], parked_poll_minutes=parked_poll_minutes,
+        pinned_rotation=pinned_rotation,
     )
 
 
@@ -547,6 +574,9 @@ def statusline(runtime=None, payload=None, spawn=subprocess.run, detach=None):
         return 0
     _disarm_unreadable(state_dir, payload)
     now = datetime.now(timezone.utc)
+    pinned = os.environ.get(pins.ENV_PIN)
+    if pinned:
+        return _pinned_reading(runtime, pinned, limits, now)
     if config.model_limits:
         try:
             _note_model(state_dir, payload, now)
@@ -592,7 +622,7 @@ def statusline(runtime=None, payload=None, spawn=subprocess.run, detach=None):
     models = _models_in_use(state_dir, now)
     relevant = _relevant(limits, models)
     rotate = core.needs_rotation(relevant, now, config.thresholds) or bool(core.expiring_sooner(
-        relevant, active, _bound(_usable(state_dir, enrolled, active, now), models), now, config.thresholds
+        relevant, active, _bound(_usable(state_dir, enrolled, active, now, config), models), now, config.thresholds
     ))
     due = config.model_limits and _scoped_due(state_dir, store, active, now)
     if not rotate and not due:
@@ -602,6 +632,32 @@ def statusline(runtime=None, payload=None, spawn=subprocess.run, detach=None):
             _report_unenrolled_active(state_dir, active)
         return 0
     (detach or (lambda: _detach_decide(state_dir)))()
+    return 0
+
+
+def _pinned_reading(runtime, account_id, limits, now):
+    """A pane pinned to an account reports that account's usage, not the shared
+    login's, so the reading is recorded there. Nothing moves: the pane keeps
+    its account to the limit, and grazr only says when it is running low."""
+    paths, _, state_dir, config = runtime
+    enrolled = accounts.load(paths, [])
+    if not any(entry.id == account_id for entry in enrolled):
+        return 0
+    with _file_lock(os.path.join(state_dir, "readings.lock"), wait=True):
+        previous = _latest_reading(paths, account_id)
+        limits = core.merged(previous, limits, now)
+        if not config.model_limits:
+            limits = [entry for entry in limits if entry.scope is None]
+        accounts.record_snapshot(paths, account_id, limits)
+    low = core.shortfall([entry for entry in limits if entry.scope is None], now, config.thresholds)
+    if low is not None:
+        name = _name_of(enrolled, account_id)
+        resets = low.resets_at.isoformat() if low.resets_at else "never"
+        _announce_once(
+            state_dir, "pinned-low:%s:%s:%s" % (account_id, low.kind, resets),
+            "grazr: pinned %s is running low" % name,
+            "%s %d%% left. Its agent stays on it; pin it elsewhere to move it" % (_window_name(low), low.remaining),
+        )
     return 0
 
 
@@ -810,6 +866,7 @@ def refresh(runtime=None):
     For a client that wants current numbers on demand."""
     runtime = runtime or _runtime()
     now = datetime.now(timezone.utc)
+    pins.prune(runtime.state_dir, _live_panes())
     for name, limits in _refresh_parked(runtime, now, force=True, include_active=True):
         print("%s: %s" % (name, "no reading" if limits is None else _describe(limits)))
     return 0
@@ -964,7 +1021,7 @@ def _decide(runtime):
         if limits is None:
             return 0
         models = _models_in_use(state_dir, now)
-        enrolled = _bound(_usable(state_dir, accounts.load(paths, config.accounts), active, now), models)
+        enrolled = _bound(_usable(state_dir, accounts.load(paths, config.accounts), active, now, config), models)
         decision = core.decide(_relevant(limits, models), active, enrolled, now, config.thresholds)
         # rotate refuses this too, but a raised error suits the person who just
         # pressed a key, not every message of every pane.
@@ -983,7 +1040,7 @@ def _decide(runtime):
     # hold the lock every other pane is waiting on.
     moved = _moved(decision, config.dry_run)
     if moved:
-        tag_all(_name_of(enrolled, decision[1]))
+        tag_all(_name_of(enrolled, decision[1]), pinned=_pinned_labels(state_dir, accounts.load(paths, [])))
     # A swap is an event and goes in every time. Everything else stands until
     # something changes, and would repeat on every message of every pane.
     if line and (moved or not _logged_last(state_dir, line)):
@@ -1007,6 +1064,16 @@ def failure(runtime=None, payload=None, detach=None):
     except (ValueError, AttributeError):
         return 0
     if error not in BLOCKING_ERRORS and error != RATE_LIMIT_ERROR:
+        return 0
+    pinned = os.environ.get(pins.ENV_PIN)
+    if pinned:
+        # The pinned account failed, not the shared one, and a pin never moves.
+        name = _name_of(accounts.load(paths, []), pinned)
+        _announce_once(
+            state_dir, "pinned-failed:%s:%s" % (pinned, error),
+            "grazr: pinned %s failed" % name,
+            "It answered %s. Its agent stays on it; pin it elsewhere to move it" % error,
+        )
         return 0
     active = claude.active_account(paths)
     if active is None:
@@ -1049,7 +1116,7 @@ def recover(runtime=None, error=None, failed=None, now=None):
             _block(state_dir, active, error, limits, now)
             pinned = False
         enrolled = _bound(
-            _usable(state_dir, accounts.load(paths, config.accounts), active, now),
+            _usable(state_dir, accounts.load(paths, config.accounts), active, now, config),
             _models_in_use(state_dir, now),
         )
         decision = _after_failure(limits, active, enrolled, now, config.thresholds, pinned)
@@ -1072,7 +1139,7 @@ def recover(runtime=None, error=None, failed=None, now=None):
 
     moved = _moved(decision, config.dry_run)
     if moved:
-        tag_all(_name_of(everyone, decision[1]))
+        tag_all(_name_of(everyone, decision[1]), pinned=_pinned_labels(state_dir, everyone))
     if line and (moved or not _logged_last(state_dir, line)):
         _log(state_dir, now, line)
     return 0
@@ -1156,10 +1223,14 @@ def _unblock(state_dir, identifier, now):
         return True
 
 
-def _usable(state_dir, enrolled, active, now):
+def _usable(state_dir, enrolled, active, now, config=None):
     """Enrolled accounts grazr may move to. The active one stays in the list,
-    since the decision needs it, and a blocked account is never a target."""
+    since the decision needs it, and a blocked account is never a target. With
+    PINNED_ROTATION=exclude, neither is one an agent is pinned to: that agent
+    has its quota to itself."""
     blocked = _read_blocked(state_dir, now)
+    if config is not None and config.pinned_rotation == pins.EXCLUDE:
+        blocked = set(blocked) | pins.held(state_dir)
     return [entry for entry in enrolled if entry.id == active or entry.id not in blocked]
 
 
@@ -1335,9 +1406,19 @@ def _dispatch(argv):
     entry_points = {
         "statusline": statusline, "decide": decide, "install": install, "uninstall": uninstall,
         "status": status, "enrol": enrol, "swap": swap, "tag": tag, "failure": failure,
-        "refresh": refresh,
+        "refresh": refresh, "pins-install": pins_install, "pins-uninstall": pins_uninstall,
     }
     command = argv[1] if len(argv) > 1 else ""
+    # Commands with arguments, from the Accounts window or a script.
+    with_arguments = {
+        ("pin", 4): lambda: pin(pane_id=argv[2], target=argv[3]),
+        ("unpin", 3): lambda: unpin(pane_id=argv[2]),
+        ("token", 3): lambda: token(target=argv[2]),
+        ("token-forget", 3): lambda: token_forget(target=argv[2]),
+        ("set", 4): lambda: set_setting(argv[2], argv[3]),
+    }
+    if (command, len(argv)) in with_arguments:
+        return with_arguments[(command, len(argv))]()
     if command == "recover" and len(argv) == 4:
         # Detached from the failure hook, with the error and the account it hit.
         return recover(error=argv[2], failed=argv[3])
@@ -1345,7 +1426,10 @@ def _dispatch(argv):
         # A named account, from a script or another client. The action passes none.
         return swap(target=argv[2])
     if command not in entry_points:
-        print("usage: grazr.py %s" % "|".join(entry_points), file=sys.stderr)
+        print("usage: grazr.py %s" % "|".join(
+            list(entry_points) + ["pin PANE ACCOUNT", "unpin PANE", "token ACCOUNT",
+                                  "token-forget ACCOUNT", "set PINNED_ROTATION exclude|keep"]
+        ), file=sys.stderr)
         return 2
     return entry_points[command]()
 
@@ -1357,18 +1441,22 @@ def tag(runtime=None):
     sidebar row. A pane start is also when to notice that the status line is no
     longer grazr's, since without it grazr sees nothing."""
     paths, _, state_dir, _ = runtime or _runtime()
+    enrolled = accounts.load(paths, [])
+    pane_id = os.environ.get("HERDR_PANE_ID")
+    pinned = _pinned_labels(state_dir, enrolled)
+    _refresh_shim(state_dir)
+    if pane_id and pane_id in pinned:
+        tag_pane(pane_id, pinned[pane_id])
+        return 0
     active = claude.active_account(paths)
     if active is None:
         return 0
-    named = next(
-        (entry.name for entry in accounts.load(paths, []) if entry.id == active),
-        active,
-    )
-    pane_id = os.environ.get("HERDR_PANE_ID")
+    named = _name_of(enrolled, active)
     if pane_id:
         tag_pane(pane_id, named)
     else:
-        tag_all(named)
+        pins.prune(state_dir, _live_panes())
+        tag_all(named, pinned=pinned)
     if not claude.statusline_installed(paths.config_dir, _record_path(state_dir)):
         line = "The status line is not grazr's, so grazr sees no usage. Run the connect action"
         if _announce_once(state_dir, "statusline-missing", "grazr: status line not connected", line):
@@ -1444,9 +1532,14 @@ def swap(runtime=None, target=None):
                     "%s failed with %s, enrol it again first"
                     % (_name_of(enrolled, next_id), refused.get("reason") or "an error")
                 )
+            if config.pinned_rotation == pins.EXCLUDE and next_id in pins.held(state_dir):
+                return _refuse_swap(
+                    "%s is pinned to an agent, and PINNED_ROTATION=exclude keeps it to that agent"
+                    % _name_of(enrolled, next_id)
+                )
         else:
             enrolled = _bound(
-                _usable(state_dir, accounts.load(paths, config.accounts), active, now),
+                _usable(state_dir, accounts.load(paths, config.accounts), active, now, config),
                 _models_in_use(state_dir, now),
             )
             next_id = core.next_account(active, enrolled, now, config.thresholds)
@@ -1468,7 +1561,7 @@ def swap(runtime=None, target=None):
         print(line)
 
     if _moved(decision, config.dry_run):
-        tag_all(_name_of(enrolled, next_id))
+        tag_all(_name_of(enrolled, next_id), pinned=_pinned_labels(state_dir, accounts.load(paths, [])))
     _log(state_dir, now, line)
     return 0
 
@@ -1515,6 +1608,18 @@ def status(runtime=None):
             print("  This login is enrolled but missing from ACCOUNTS, so grazr can rotate away but not back")
         else:
             print("  This login is not enrolled, so only the swap key moves off it. Enrol it to rotate on its own")
+
+    pinned = pins.load(state_dir)
+    if pinned:
+        everyone = accounts.load(paths, [])
+        print("\npinned agents (%s from the rotation):" % (
+            "kept" if config.pinned_rotation == pins.KEEP else "excluded"))
+        for pane, entry in sorted(pinned.items()):
+            wanted, running = entry.get("account"), entry.get("running")
+            line = "  %-10s %s" % (pane, _name_of(everyone, wanted) if wanted else "unpinned")
+            if running and running != wanted:
+                line += "  (still running on %s until Claude restarts)" % _name_of(everyone, running)
+            print(line)
 
     last = _last_decision(state_dir)
     if last:
@@ -1623,6 +1728,257 @@ def _enrol_between_rotations(runtime, name, source):
         if not acquired:
             raise RuntimeError("Busy rotating, try again in a moment")
         return claude.enrol(runtime.paths, runtime.store, name, source)
+
+
+
+# Pinning an agent to an account. See pins.py.
+
+SHIM_LIB = ("pins.py", "stores.py", "atomic.py")
+RC_BEGIN = "# >>> grazr: pinned agents >>>"
+RC_END = "# <<< grazr: pinned agents <<<"
+TOKEN_PREFIX = "sk-ant-oat01-"
+
+
+def _account_named(enrolled, target):
+    return next((entry for entry in enrolled if target in (entry.name, entry.id)), None)
+
+
+def pin(runtime=None, pane_id=None, target=None):
+    """Pin a Herdr pane to an account. Claude there moves at its next start,
+    since a running process cannot be handed another login."""
+    runtime = runtime or _runtime()
+    paths, store, state_dir, config = runtime
+    now = datetime.now(timezone.utc)
+    enrolled = accounts.load(paths, [])
+    account = _account_named(enrolled, target)
+    if account is None:
+        print("grazr: no enrolled account is named %s" % target)
+        return 1
+    if not store.read_token(account.id) or pins.token_expired(state_dir, account.id, now):
+        print("grazr: %s has no current pin token. Set one up first: grazr.py token %s"
+              % (account.name, account.name))
+        return 1
+    pins.pin(state_dir, pane_id, account.id, now)
+    print("Pinned %s to %s. Claude in that pane moves to it when it next starts" % (pane_id, account.name))
+    if config.pinned_rotation == pins.EXCLUDE and claude.active_account(paths) == account.id:
+        # The shared rotation is on the account this agent now owns.
+        print("The other agents share %s now, so grazr moves them off it" % account.name)
+        swap(runtime)
+    return 0
+
+
+def unpin(runtime=None, pane_id=None):
+    runtime = runtime or _runtime()
+    if pins.unpin(runtime.state_dir, pane_id, datetime.now(timezone.utc)):
+        print("Unpinned %s. Claude there joins the shared rotation when it next starts" % pane_id)
+    else:
+        print("%s was not pinned" % pane_id)
+    return 0
+
+
+def token(runtime=None, target=None, verify=None, ask=None):
+    """Store an account's long-lived token for pinned agents. Claude makes it,
+    with `claude setup-token` in your browser; grazr only keeps it."""
+    runtime = runtime or _runtime()
+    paths, store, state_dir, _ = runtime
+    account = _account_named(accounts.load(paths, []), target)
+    if account is None:
+        print("grazr: no enrolled account is named %s" % target)
+        return 1
+    print("A pinned agent runs on a token of its own, which lasts a year.")
+    print("Sign in to claude.ai in your browser as %s, then let Claude make the token.\n" % account.name)
+    source = os.path.abspath(os.path.join(paths.accounts_dir, "..", "token-%d" % os.getpid()))
+    os.makedirs(source, mode=0o700, exist_ok=True)
+    try:
+        try:
+            subprocess.run(["claude", "setup-token"], env=dict(os.environ, CLAUDE_CONFIG_DIR=source))
+        except FileNotFoundError:
+            print("There is no claude on this pane's PATH, so it cannot make the token")
+            return 1
+    finally:
+        claude.discard_isolated_login(store, source)
+    pasted = (ask or getpass.getpass)("\nPaste the token it printed (it stays hidden): ").strip()
+    if not pasted.startswith(TOKEN_PREFIX):
+        print("That is not a Claude token (they start with %s), nothing stored" % TOKEN_PREFIX)
+        return 1
+    owner = (verify or claude.token_account)(pasted)
+    if owner is not None and owner.get("uuid") != account.id:
+        print("That token is for %s, not %s, so nothing was stored. Sign in as %s and try again"
+              % (owner.get("email") or "another account", account.name, account.name))
+        return 1
+    if owner is None:
+        print("Claude does not say whose token it is. Is it %s's? (y/n) " % account.name, end="", flush=True)
+        if read_key() != "y":
+            print("\nNothing stored")
+            return 1
+        print()
+    store.write_token(account.id, pasted)
+    pins.record_token(state_dir, account.id, datetime.now(timezone.utc))
+    print("Stored. Agents can now be pinned to %s" % account.name)
+    return 0
+
+
+def token_forget(runtime=None, target=None):
+    runtime = runtime or _runtime()
+    paths, store, state_dir, _ = runtime
+    account = _account_named(accounts.load(paths, []), target)
+    if account is None:
+        print("grazr: no enrolled account is named %s" % target)
+        return 1
+    store.discard_token(account.id)
+    pins.forget_token(state_dir, account.id)
+    print("Forgot %s's token. Its pinned agents fall back to the shared account at their next start" % account.name)
+    return 0
+
+
+SETTABLE = {"PINNED_ROTATION": pins.ROTATION_MODES}
+
+
+def set_setting(key, value, path=None):
+    """Change one setting in config.env, keeping every other line as it is."""
+    if key not in SETTABLE:
+        print("grazr: only %s can be set this way" % ", ".join(SETTABLE))
+        return 1
+    if value not in SETTABLE[key]:
+        print("grazr: %s must be %s" % (key, " or ".join(SETTABLE[key])))
+        return 1
+    path = path or _config_path()
+    load_config(path)
+    with open(path) as handle:
+        lines = handle.read().splitlines(True)
+    replaced = False
+    for index, line in enumerate(lines):
+        if line.split("=", 1)[0].strip() == key:
+            comment = line[line.index("#"):].rstrip("\n") if "#" in line else ""
+            lines[index] = ("%s=%s  %s" % (key, value, comment)).rstrip() + "\n"
+            replaced = True
+    if not replaced:
+        if lines and not lines[-1].endswith("\n"):
+            lines[-1] += "\n"
+        lines.append("%s=%s\n" % (key, value))
+    atomic.write(path, "".join(lines))
+    print("%s=%s" % (key, value))
+    return 0
+
+
+def _shim_dirs(state_dir):
+    return os.path.join(state_dir, "bin"), os.path.join(state_dir, "lib")
+
+
+def _copy_shim(state_dir):
+    """Put the shim and the modules it needs into the state dir. Returns
+    whether anything changed."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    bin_dir, lib_dir = _shim_dirs(state_dir)
+    changed = False
+    for source, target, mode in [(os.path.join(here, "shim.py"), os.path.join(bin_dir, "claude"), 0o700)] + [
+        (os.path.join(here, name), os.path.join(lib_dir, name), 0o600) for name in SHIM_LIB
+    ]:
+        with open(source) as handle:
+            text = handle.read()
+        try:
+            with open(target) as handle:
+                if handle.read() == text:
+                    continue
+        except OSError:
+            pass
+        os.makedirs(os.path.dirname(target), mode=0o700, exist_ok=True)
+        atomic.write(target, text)
+        os.chmod(target, mode)
+        changed = True
+    return changed
+
+
+def _refresh_shim(state_dir):
+    """An update of grazr brings a new shim; an installed one follows it."""
+    if os.path.exists(os.path.join(_shim_dirs(state_dir)[0], "claude")):
+        try:
+            _copy_shim(state_dir)
+        except OSError:
+            pass
+
+
+def _shell_files():
+    """The shells' own startup files, which a Herdr pane's shell reads."""
+    home = os.path.expanduser("~")
+    found = [os.path.join(home, name) for name in (".zshrc", ".bashrc") if os.path.exists(os.path.join(home, name))]
+    if not found:
+        shell = os.path.basename(os.environ.get("SHELL") or "bash")
+        found = [os.path.join(home, ".zshrc" if shell == "zsh" else ".bashrc")]
+    return found
+
+
+def _without_block(text):
+    if RC_BEGIN not in text:
+        return text
+    before, _, rest = text.partition(RC_BEGIN)
+    _, _, after = rest.partition(RC_END)
+    return before.rstrip("\n") + ("\n" if before.strip() else "") + after.lstrip("\n")
+
+
+def _rc_block(bin_dir):
+    """Last in the file, so it lands ahead of everything put on PATH before it.
+    Any earlier copy goes first, so a nested shell keeps it in front."""
+    quoted = shlex.quote(bin_dir)
+    return "\n".join([
+        RC_BEGIN,
+        "# grazr: a Herdr pane runs Claude through this, so an agent pinned to an account stays on it.",
+        'if [ -n "$HERDR_PANE_ID" ]; then _grazr_bin=%s; '
+        'PATH="$_grazr_bin:${PATH//"$_grazr_bin:"/}"; export PATH; unset _grazr_bin; fi' % quoted,
+        RC_END,
+        "",
+    ])
+
+
+def _rewrite(path, text):
+    """A shell file in place, its mode kept. A symlinked one (a dotfiles repo)
+    is written where it points, so the link survives."""
+    path = os.path.realpath(path)
+    try:
+        mode = os.stat(path).st_mode & 0o777
+    except FileNotFoundError:
+        mode = 0o644
+    atomic.write(path, text)
+    os.chmod(path, mode)
+
+
+def pins_install(runtime=None):
+    """Install the shim pinned agents need, and put it on Herdr panes' PATH."""
+    _, _, state_dir, _ = runtime or _runtime()
+    _copy_shim(state_dir)
+    bin_dir = _shim_dirs(state_dir)[0]
+    for path in _shell_files():
+        try:
+            with open(path) as handle:
+                text = handle.read()
+        except FileNotFoundError:
+            text = ""
+        text = _without_block(text)
+        text = (text.rstrip("\n") + "\n\n" if text.strip() else "") + _rc_block(bin_dir)
+        _rewrite(path, text)
+        print("Added grazr's pinned-agents block to %s" % path)
+    print("New Herdr panes run Claude through %s. Panes already open pick it up in a new shell" % bin_dir)
+    return 0
+
+
+def pins_uninstall(runtime=None):
+    _, _, state_dir, _ = runtime or _runtime()
+    for path in _shell_files():
+        try:
+            with open(path) as handle:
+                text = handle.read()
+        except FileNotFoundError:
+            continue
+        if RC_BEGIN in text:
+            _rewrite(path, _without_block(text))
+            print("Removed grazr's pinned-agents block from %s" % path)
+    for directory in _shim_dirs(state_dir):
+        if os.path.isdir(directory):
+            for name in os.listdir(directory):
+                os.unlink(os.path.join(directory, name))
+            os.rmdir(directory)
+    print("Pinned agents run on the shared account from their next start")
+    return 0
 
 
 if __name__ == "__main__":

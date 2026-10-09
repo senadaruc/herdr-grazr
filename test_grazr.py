@@ -20,6 +20,7 @@ import atomic
 import claude
 import core
 import grazr
+import pins
 import stores
 from core import Account, Limit, decide, merged, next_account
 
@@ -54,7 +55,8 @@ def account_named(name, identifier, snapshot=None):
 
 
 class FakeStore:
-    def __init__(self, live=None, parked=None, isolated=None, refuse_over=None):
+    def __init__(self, live=None, parked=None, isolated=None, refuse_over=None, tokens=None):
+        self.tokens = tokens if tokens is not None else {}
         self.live = live
         self.parked = dict(parked or {})
         self.isolated = dict(isolated or {})
@@ -85,6 +87,15 @@ class FakeStore:
     def discard_isolated(self, config_dir):
         self.isolated.pop(config_dir, None)
         return self.discard_result
+
+    def read_token(self, account_id):
+        return self.tokens.get(account_id)
+
+    def write_token(self, account_id, token):
+        self.tokens[account_id] = token
+
+    def discard_token(self, account_id):
+        self.tokens.pop(account_id, None)
 
 
 def spent_account():
@@ -2121,7 +2132,7 @@ class ActOnDecisionTest(unittest.TestCase):
         self.notices = []
         self.tags = []
         self.dry_run = False
-        patch = mock.patch.object(grazr, "tag_all", lambda name: self.tags.append(name))
+        patch = mock.patch.object(grazr, "tag_all", lambda name, pinned=None: self.tags.append(name))
         patch.start()
         self.addCleanup(patch.stop)
 
@@ -2408,7 +2419,7 @@ class EnrolledPairFixture(unittest.TestCase):
             raise RuntimeError(self.refusal)
         self.rotations.append(arguments)
 
-    def record_tag(self, name):
+    def record_tag(self, name, pinned=None):
         """Notes whether the rotation lock was free while panes were tagged."""
         self.tags.append(name)
         with grazr._rotation_lock(self.state_dir) as free:
@@ -2463,10 +2474,17 @@ class EnrolledPairFixture(unittest.TestCase):
                 config_dir=self.claude_dir,
                 accounts_dir=os.path.join(self.state_dir, "accounts"),
             ),
-            store=FakeStore(),
+            store=FakeStore(tokens=self.tokens),
             state_dir=self.state_dir,
             config=grazr.load_config(os.path.join(self.state_dir, "config.env")),
         )
+
+    @property
+    def tokens(self):
+        """Pin tokens, kept across the runtimes one test makes."""
+        if not hasattr(self, "_tokens"):
+            self._tokens = {}
+        return self._tokens
 
 
 class TagTest(EnrolledPairFixture):
@@ -3535,7 +3553,7 @@ class InjectedRuntimeTest(unittest.TestCase):
         # Nothing in the environment points at any of it.
         with mock.patch.dict(os.environ, {}, clear=True), \
                 mock.patch.object(grazr, "notify", lambda title, body: True), \
-                mock.patch.object(grazr, "tag_all", lambda name: None), \
+                mock.patch.object(grazr, "tag_all", lambda name, pinned=None: None), \
                 contextlib.redirect_stdout(io.StringIO()):
             grazr.statusline(runtime, payload, detach=lambda: grazr.decide(runtime))
 
@@ -4270,6 +4288,465 @@ class StatusNamesTheModelTest(unittest.TestCase):
         self.assertIn(
             "Fable weekly 0% left", grazr._describe([_weekly(50, reset), _model_limit(0, reset)])
         )
+
+
+class PinsTest(unittest.TestCase):
+    """pins.json: which pane is pinned to which account, and what Claude there
+    actually started on."""
+
+    def setUp(self):
+        self.state = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.state, True)
+
+    def test_a_pin_waits_for_claude_to_start_before_it_counts_as_running(self):
+        pins.pin(self.state, "w1:p1", "uuid-a", NOW)
+        self.assertEqual(pins.running_on(self.state), {})
+
+        pins.started(self.state, "w1:p1", "uuid-a")
+
+        self.assertEqual(pins.running_on(self.state), {"w1:p1": "uuid-a"})
+        self.assertEqual(pins.held(self.state), {"uuid-a"})
+
+    def test_unpinning_a_running_pane_keeps_its_account_held_until_claude_restarts(self):
+        """Claude keeps the token it started with, so the account is still spent there."""
+        pins.pin(self.state, "w1:p1", "uuid-a", NOW)
+        pins.started(self.state, "w1:p1", "uuid-a")
+
+        self.assertTrue(pins.unpin(self.state, "w1:p1", NOW))
+        self.assertEqual(pins.held(self.state), {"uuid-a"})
+
+        pins.started(self.state, "w1:p1", None)
+        self.assertEqual(pins.load(self.state), {})
+
+    def test_unpinning_a_pane_claude_never_started_in_forgets_it(self):
+        pins.pin(self.state, "w1:p1", "uuid-a", NOW)
+
+        pins.unpin(self.state, "w1:p1", NOW)
+
+        self.assertEqual(pins.load(self.state), {})
+        self.assertFalse(pins.unpin(self.state, "w1:p1", NOW))
+
+    def test_pins_on_panes_herdr_no_longer_knows_go_but_not_when_it_cannot_say(self):
+        pins.pin(self.state, "w1:p1", "uuid-a", NOW)
+        pins.pin(self.state, "w1:p2", "uuid-b", NOW)
+
+        self.assertEqual(pins.prune(self.state, None), [])
+        self.assertEqual(pins.prune(self.state, ["w1:p2"]), ["w1:p1"])
+        self.assertEqual(list(pins.load(self.state)), ["w1:p2"])
+
+    def test_a_token_lasts_a_year(self):
+        pins.record_token(self.state, "uuid-a", NOW)
+
+        self.assertFalse(pins.token_expired(self.state, "uuid-a", NOW + timedelta(days=364)))
+        self.assertTrue(pins.token_expired(self.state, "uuid-a", NOW + timedelta(days=366)))
+        pins.forget_token(self.state, "uuid-a")
+        self.assertEqual(pins.tokens(self.state), {})
+
+    def test_an_unreadable_file_is_no_pins(self):
+        with open(os.path.join(self.state, pins.PINS), "w") as handle:
+            handle.write("not json")
+
+        self.assertEqual(pins.load(self.state), {})
+
+
+class ShimTest(unittest.TestCase):
+    """The `claude` on a Herdr pane's PATH: the pinned account's token in a
+    pinned pane, the real Claude unchanged everywhere else."""
+
+    def setUp(self):
+        import shim
+        self.shim = shim
+        self.state = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.state, True)
+        self.read = []
+
+    def token(self, state, account):
+        self.read.append(account)
+        return {"uuid-a": "sk-ant-oat01-A"}.get(account)
+
+    def env(self, **environ):
+        return self.shim.pinned_env(environ, state=self.state, read_token=self.token, clock=NOW.timestamp)
+
+    def test_outside_herdr_nothing_changes(self):
+        environ, warning = self.env(PATH="/bin")
+
+        self.assertEqual((environ, warning, self.read), ({"PATH": "/bin"}, None, []))
+
+    def test_an_unpinned_pane_starts_the_real_claude_unchanged(self):
+        environ, warning = self.env(HERDR_PANE_ID="w1:p1")
+
+        self.assertEqual((environ, warning), ({"HERDR_PANE_ID": "w1:p1"}, None))
+
+    def test_a_pinned_pane_runs_on_the_accounts_token(self):
+        pins.pin(self.state, "w1:p1", "uuid-a", NOW)
+
+        environ, warning = self.env(HERDR_PANE_ID="w1:p1")
+
+        self.assertIsNone(warning)
+        self.assertEqual(environ[pins.ENV_TOKEN], "sk-ant-oat01-A")
+        self.assertEqual(environ[pins.ENV_PIN], "uuid-a")
+        self.assertEqual(pins.running_on(self.state), {"w1:p1": "uuid-a"})
+
+    def test_a_pin_without_a_token_falls_back_to_the_shared_login_and_says_so(self):
+        pins.pin(self.state, "w1:p1", "uuid-b", NOW)
+
+        environ, warning = self.env(HERDR_PANE_ID="w1:p1")
+
+        self.assertNotIn(pins.ENV_TOKEN, environ)
+        self.assertIn("no current token", warning)
+        self.assertEqual(pins.running_on(self.state), {})
+
+    def test_an_expired_token_is_not_even_read(self):
+        pins.pin(self.state, "w1:p1", "uuid-a", NOW)
+        pins.record_token(self.state, "uuid-a", NOW - timedelta(days=400))
+
+        environ, warning = self.env(HERDR_PANE_ID="w1:p1")
+
+        self.assertEqual((self.read, pins.ENV_TOKEN in environ), ([], False))
+        self.assertIsNotNone(warning)
+
+    def test_a_token_already_in_the_environment_is_left_alone(self):
+        """Yours, or the pinned Claude's that this one runs under."""
+        pins.pin(self.state, "w1:p1", "uuid-a", NOW)
+
+        environ, _ = self.env(HERDR_PANE_ID="w1:p1", CLAUDE_CODE_OAUTH_TOKEN="mine")
+
+        self.assertEqual((environ[pins.ENV_TOKEN], self.read), ("mine", []))
+
+    def test_the_real_claude_is_the_next_one_on_path(self):
+        here = os.path.join(self.state, "bin")
+        elsewhere = os.path.join(self.state, "real")
+        for directory in (here, elsewhere):
+            os.makedirs(directory)
+            path = os.path.join(directory, "claude")
+            with open(path, "w") as handle:
+                handle.write("#!/bin/sh\n")
+            os.chmod(path, 0o755)
+
+        with mock.patch.object(self.shim, "HERE", here):
+            found = self.shim.real_claude(os.pathsep.join([here, elsewhere]))
+
+        self.assertEqual(found, os.path.join(elsewhere, "claude"))
+
+    def test_the_shim_runs_from_its_copy_without_the_plugin(self):
+        """An installed shim starts the real Claude from <state>/bin."""
+        grazr._copy_shim(self.state)
+        real = os.path.join(self.state, "real")
+        os.makedirs(real)
+        with open(os.path.join(real, "claude"), "w") as handle:
+            handle.write('#!/bin/sh\nprintf "%s|%s" "$CLAUDE_CODE_OAUTH_TOKEN" "$*"\n')
+        os.chmod(os.path.join(real, "claude"), 0o755)
+        environ = {
+            "PATH": os.pathsep.join([os.path.join(self.state, "bin"), real, "/usr/bin", "/bin"]),
+            "HOME": self.state,
+        }
+
+        output = subprocess.run(
+            [os.path.join(self.state, "bin", "claude"), "--resume", "x"],
+            env=environ, capture_output=True, text=True, timeout=30,
+        ).stdout
+
+        self.assertEqual(output, "|--resume x")
+        self.assertFalse(grazr._copy_shim(self.state), "a second copy changes nothing")
+
+
+class PinnedRotationTest(EnrolledPairFixture):
+    """A pane pinned to an account: its readings, its failures, and whether
+    the shared rotation may still move to that account."""
+
+    def payload(self, used):
+        return json.dumps({"rate_limits": {"five_hour": {"used_percentage": used, "resets_at": None}}})
+
+    def statusline(self, used, **environment):
+        return self.invoke(
+            lambda runtime: grazr.statusline(runtime, self.payload(used), detach=lambda: grazr.decide(runtime)),
+            **environment
+        )
+
+    def snapshot(self, identifier):
+        with open(os.path.join(self.state_dir, "accounts", identifier + ".json")) as handle:
+            return json.load(handle).get("snapshot")
+
+    def test_a_pinned_panes_reading_goes_to_its_account_and_never_rotates(self):
+        self.statusline(used=95, GRAZR_PIN="uuid-personal")
+
+        self.assertEqual(self.snapshot("uuid-personal")[0]["remaining"], 5)
+        self.assertIsNone(self.snapshot("uuid-work"))
+        self.assertEqual(self.rotations, [])
+        self.assertEqual(self.notices[0][0], "grazr: pinned personal is running low")
+
+    def test_a_pinned_panes_failure_moves_nothing(self):
+        detached = []
+        payload = json.dumps({"hook_event_name": "StopFailure", "error": "rate_limit"})
+
+        self.invoke(lambda runtime: grazr.failure(runtime, payload, detach=lambda: detached.append(1)),
+                    GRAZR_PIN="uuid-personal")
+
+        self.assertEqual(detached, [])
+        self.assertEqual(self.notices[0][0], "grazr: pinned personal failed")
+
+    def test_excluded_a_pinned_account_is_never_rotated_to(self):
+        pins.pin(self.state_dir, "w1:p1", "uuid-personal", NOW)
+
+        self.statusline(used=95)
+
+        self.assertEqual(self.rotations, [])
+
+    def test_kept_a_pinned_account_is_still_rotated_to(self):
+        self.write_config('ACCOUNTS="work personal"\nPINNED_ROTATION=keep\n')
+        pins.pin(self.state_dir, "w1:p1", "uuid-personal", NOW)
+
+        self.statusline(used=95)
+
+        self.assertEqual(self.rotations[0][2:4], ("uuid-work", "uuid-personal"))
+
+    def test_the_swap_key_refuses_an_excluded_pinned_account_by_name(self):
+        pins.pin(self.state_dir, "w1:p1", "uuid-personal", NOW)
+
+        code, printed = self.invoke(lambda runtime: grazr.swap(runtime, target="personal"))
+
+        self.assertEqual((code, self.rotations), (1, []))
+        self.assertIn("pinned to an agent", printed)
+
+    def test_a_rotation_leaves_a_pinned_panes_tag_alone(self):
+        pins.pin(self.state_dir, "w1:p1", "uuid-personal", NOW)
+        pins.started(self.state_dir, "w1:p1", "uuid-personal")
+        tagged = []
+        answers = {
+            ("agent", "list"): {"result": {"agents": [
+                {"agent": "claude", "pane_id": "w1:p1", "tokens": {}},
+                {"agent": "claude", "pane_id": "w1:p2", "tokens": {}},
+            ]}},
+        }
+
+        def herdr(spawn, *arguments):
+            if arguments[:2] == ("pane", "report-metadata"):
+                tagged.append((arguments[2], arguments[-1]))
+            if arguments[:2] == ("pane", "get"):
+                return json.dumps({"result": {"pane": {"scroll": {"offset_from_bottom": 0}}}})
+            return json.dumps(answers.get(arguments[:2], {}))
+
+        with mock.patch.object(grazr, "_herdr", herdr):
+            grazr.tag_all("work", pinned=grazr._pinned_labels(self.state_dir, accounts.load(self.runtime().paths, [])))
+
+        self.assertEqual(tagged, [("w1:p1", "grazr=personal · pinned"), ("w1:p2", "grazr=work")])
+
+    def test_a_pinned_pane_is_tagged_with_its_own_account(self):
+        pins.pin(self.state_dir, "w9:p1", "uuid-personal", NOW)
+        pins.started(self.state_dir, "w9:p1", "uuid-personal")
+
+        self.invoke(grazr.tag, HERDR_PANE_ID="w9:p1")
+
+        self.assertEqual(self.tags, [("w9:p1", "personal · pinned")])
+
+
+class PinCommandTest(EnrolledPairFixture):
+    def test_an_account_without_a_token_cannot_be_pinned(self):
+        code, printed = self.invoke(lambda runtime: grazr.pin(runtime, "w1:p1", "personal"))
+
+        self.assertEqual((code, pins.load(self.state_dir)), (1, {}))
+        self.assertIn("no current pin token", printed)
+
+    def test_a_pin_names_the_account_by_name_or_id(self):
+        self.tokens["uuid-personal"] = "sk-ant-oat01-P"
+
+        code, _ = self.invoke(lambda runtime: grazr.pin(runtime, "w1:p1", "personal"))
+
+        self.assertEqual(code, 0)
+        self.assertEqual(pins.load(self.state_dir)["w1:p1"]["account"], "uuid-personal")
+        self.assertEqual(self.rotations, [])
+
+    def test_pinning_the_shared_account_moves_the_others_off_it_when_excluded(self):
+        self.tokens["uuid-work"] = "sk-ant-oat01-W"
+
+        self.invoke(lambda runtime: grazr.pin(runtime, "w1:p1", "work"))
+
+        self.assertEqual(self.rotations[0][2:4], ("uuid-work", "uuid-personal"))
+
+    def test_unpin(self):
+        self.tokens["uuid-personal"] = "sk-ant-oat01-P"
+        self.invoke(lambda runtime: grazr.pin(runtime, "w1:p1", "personal"))
+
+        _, printed = self.invoke(lambda runtime: grazr.unpin(runtime, "w1:p1"))
+
+        self.assertIn("Unpinned", printed)
+        self.assertEqual(pins.load(self.state_dir), {})
+
+
+class TokenCommandTest(EnrolledPairFixture):
+    def run_token(self, pasted, owner, key="y"):
+        with mock.patch.object(grazr.subprocess, "run", lambda *a, **k: None), \
+                mock.patch.object(grazr, "read_key", lambda: key):
+            return self.invoke(lambda runtime: grazr.token(
+                runtime, "personal", verify=lambda token: owner, ask=lambda prompt: pasted))
+
+    def test_a_token_for_the_account_is_stored(self):
+        code, _ = self.run_token("sk-ant-oat01-P", {"uuid": "uuid-personal", "email": "p@x"})
+
+        self.assertEqual((code, self.tokens), (0, {"uuid-personal": "sk-ant-oat01-P"}))
+        self.assertIn("uuid-personal", pins.tokens(self.state_dir))
+
+    def test_a_token_for_another_account_is_refused(self):
+        code, printed = self.run_token("sk-ant-oat01-W", {"uuid": "uuid-work", "email": "work@x"})
+
+        self.assertEqual((code, self.tokens), (1, {}))
+        self.assertIn("is for work@x, not personal", printed)
+
+    def test_when_claude_will_not_say_whose_it_is_you_are_asked(self):
+        self.assertEqual(self.run_token("sk-ant-oat01-P", None, key="n")[0], 1)
+        self.assertEqual(self.tokens, {})
+        self.assertEqual(self.run_token("sk-ant-oat01-P", None, key="y")[0], 0)
+
+    def test_something_that_is_not_a_token_is_refused(self):
+        self.assertEqual(self.run_token("hunter2", None)[0], 1)
+
+    def test_forgetting_removes_the_token_and_its_record(self):
+        self.run_token("sk-ant-oat01-P", {"uuid": "uuid-personal"})
+
+        self.invoke(lambda runtime: grazr.token_forget(runtime, "personal"))
+
+        self.assertEqual((self.tokens, pins.tokens(self.state_dir)), ({}, {}))
+
+
+class PinnedRotationSettingTest(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.directory, True)
+        self.path = os.path.join(self.directory, "config.env")
+
+    def write(self, text):
+        with open(self.path, "w") as handle:
+            handle.write(text)
+
+    def test_it_defaults_to_exclude_and_rejects_anything_else(self):
+        self.write('ACCOUNTS="a"\n')
+        self.assertEqual(grazr.load_config(self.path).pinned_rotation, "exclude")
+        self.write('ACCOUNTS="a"\nPINNED_ROTATION=sometimes\n')
+        with self.assertRaises(ValueError):
+            grazr.load_config(self.path)
+
+    def test_set_changes_the_one_line_and_keeps_its_comment(self):
+        self.write('ACCOUNTS="a b"   # order\nPINNED_ROTATION=exclude  # pinned\n')
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            grazr.set_setting("PINNED_ROTATION", "keep", self.path)
+
+        with open(self.path) as handle:
+            self.assertEqual(handle.read(), 'ACCOUNTS="a b"   # order\nPINNED_ROTATION=keep  # pinned\n')
+
+    def test_set_appends_a_setting_the_file_lacks(self):
+        self.write('ACCOUNTS="a"')
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            grazr.set_setting("PINNED_ROTATION", "keep", self.path)
+
+        self.assertEqual(grazr.load_config(self.path).pinned_rotation, "keep")
+
+    def test_set_touches_nothing_else(self):
+        self.write('ACCOUNTS="a"\n')
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(grazr.set_setting("ACCOUNTS", "b", self.path), 1)
+            self.assertEqual(grazr.set_setting("PINNED_ROTATION", "maybe", self.path), 1)
+
+
+class PinsInstallTest(unittest.TestCase):
+    def setUp(self):
+        self.home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.home, True)
+        self.state = os.path.join(self.home, "state")
+        os.makedirs(self.state)
+        self.runtime = SimpleNamespace(state_dir=self.state)
+
+    def run_entry(self, entry):
+        with mock.patch.dict(os.environ, {"HOME": self.home, "SHELL": "/bin/zsh"}), \
+                contextlib.redirect_stdout(io.StringIO()):
+            entry(grazr.Runtime(None, None, self.state, None))
+
+    def read(self, name):
+        with open(os.path.join(self.home, name)) as handle:
+            return handle.read()
+
+    def test_the_block_goes_last_once_however_often_it_is_installed(self):
+        dotfiles = os.path.join(self.home, "dotfiles")
+        os.makedirs(dotfiles)
+        with open(os.path.join(dotfiles, "zshrc"), "w") as handle:
+            handle.write('export PATH="$HOME/.local/bin:$PATH"\n')
+        os.chmod(os.path.join(dotfiles, "zshrc"), 0o640)
+        os.symlink(os.path.join(dotfiles, "zshrc"), os.path.join(self.home, ".zshrc"))
+
+        self.run_entry(grazr.pins_install)
+        self.run_entry(grazr.pins_install)
+
+        text = self.read(".zshrc")
+        self.assertEqual(text.count(grazr.RC_BEGIN), 1)
+        self.assertTrue(text.rstrip().endswith(grazr.RC_END))
+        self.assertTrue(text.startswith('export PATH="$HOME/.local/bin:$PATH"\n'))
+        self.assertTrue(os.path.islink(os.path.join(self.home, ".zshrc")), "the dotfiles link survives")
+        self.assertEqual(os.stat(os.path.join(dotfiles, "zshrc")).st_mode & 0o777, 0o640)
+        self.assertTrue(os.access(os.path.join(self.state, "bin", "claude"), os.X_OK))
+
+    def test_the_block_puts_the_shim_first_only_in_a_herdr_pane(self):
+        self.run_entry(grazr.pins_install)
+        rc = os.path.join(self.home, ".zshrc")
+        bin_dir = os.path.join(self.state, "bin")
+
+        def path_after(shell, environment):
+            return subprocess.run(
+                [shell, "-c", '. "$1"; printf %s "$PATH"', "_", rc],
+                env=environment, capture_output=True, text=True, timeout=30,
+            ).stdout
+
+        for shell in [name for name in ("bash", "zsh") if shutil.which(name)]:
+            with self.subTest(shell=shell):
+                # HOME too, or zsh reads the real ~/.zshenv first.
+                self.assertEqual(path_after(shell, {"PATH": "/usr/bin:/bin", "HOME": self.home}), "/usr/bin:/bin")
+                self.assertEqual(
+                    path_after(shell, {"PATH": "/usr/bin:%s:/bin" % bin_dir, "HERDR_PANE_ID": "w1:p1", "HOME": self.home}),
+                    "%s:/usr/bin:/bin" % bin_dir,
+                )
+
+    def test_uninstall_takes_out_the_block_and_the_shim(self):
+        with open(os.path.join(self.home, ".zshrc"), "w") as handle:
+            handle.write("alias ll='ls -l'\n")
+        self.run_entry(grazr.pins_install)
+
+        self.run_entry(grazr.pins_uninstall)
+
+        self.assertEqual(self.read(".zshrc"), "alias ll='ls -l'\n")
+        self.assertFalse(os.path.exists(os.path.join(self.state, "bin")))
+
+
+class TokenStoreTest(unittest.TestCase):
+    def test_linux_keeps_a_token_beside_the_parked_logins_owner_only(self):
+        state = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, state, True)
+        store = stores.FileStore(os.path.join(state, "live.json"), os.path.join(state, "credentials"))
+
+        store.write_token("uuid-a", "sk-ant-oat01-A")
+
+        path = stores.token_path(state, "uuid-a")
+        self.assertEqual(store.read_token("uuid-a"), "sk-ant-oat01-A")
+        self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+        store.discard_token("uuid-a")
+        store.discard_token("uuid-a")
+        self.assertIsNone(store.read_token("uuid-a"))
+
+    def test_the_keychain_keeps_a_token_under_its_own_item(self):
+        calls = []
+
+        def spawn(argv, **keywords):
+            calls.append((argv, keywords.get("input")))
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        store = stores.KeychainStore(None, "me", spawn=spawn)
+        store.write_token("uuid-a", "sk-ant-oat01-A")
+        store.discard_token("uuid-a")
+
+        written = calls[0][1]
+        self.assertIn("-s grazr-token-uuid-a -a me", written)
+        self.assertNotIn("sk-ant-oat01-A", " ".join(calls[0][0]), "the token never rides argv")
+        self.assertEqual(calls[1][0][-4:], ["-s", "grazr-token-uuid-a", "-a", "me"])
 
 
 if __name__ == "__main__":

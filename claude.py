@@ -198,6 +198,25 @@ def fetch_usage_limits(blob, opener=urllib.request.urlopen):
     return None if reply is None else usage_limits(reply)
 
 
+PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
+
+
+def token_account(token, opener=urllib.request.urlopen):
+    """{"uuid", "email"} of the account a pin token belongs to, or None when
+    Claude will not say: a setup-token may lack the profile scope."""
+    request = urllib.request.Request(PROFILE_URL, headers={
+        "Authorization": "Bearer " + token,
+        "anthropic-beta": "oauth-2025-04-20",
+        "User-Agent": USAGE_USER_AGENT,
+    })
+    try:
+        with opener(request, timeout=USAGE_TIMEOUT_SECONDS) as response:
+            account = json.loads(response.read().decode("utf-8"))["account"]
+        return {"uuid": account["uuid"], "email": account.get("email") or account.get("email_address")}
+    except (urllib.error.URLError, OSError, ValueError, UnicodeDecodeError, KeyError, TypeError):
+        return None
+
+
 def _fetch_usage(blob, opener):
     token = access_token(blob)
     if token is None:

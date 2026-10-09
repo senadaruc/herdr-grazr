@@ -1,6 +1,6 @@
 id = "wazum.grazr"
 name = "grazr"
-version = "0.4.7+senad.2"
+version = "0.4.7+senad.3"
 min_herdr_version = "0.8.0"
 description = "Automatically switches Claude Code to another of your accounts before the usage limit hits: account rotation for multiple subscriptions, with no prompt and no lost turn"
 platforms = ["macos", "linux"]
@@ -36,6 +36,20 @@ title = "grazr: tag every pane with the active account"
 description = "Publish the $grazr token to every Claude pane, for after you add the sidebar row"
 contexts = ["global", "workspace"]
 command = ["python3", "grazr.py", "tag"]
+
+[[actions]]
+id = "pins-install"
+title = "grazr: let agents be pinned to an account"
+description = "Put grazr's claude shim first on PATH in Herdr panes, so an agent pinned to an account runs on that account's token, after a restart too"
+contexts = ["global", "workspace"]
+command = ["python3", "grazr.py", "pins-install"]
+
+[[actions]]
+id = "pins-uninstall"
+title = "grazr: stop pinning agents to accounts"
+description = "Remove the claude shim and its PATH block; pinned agents run on the shared account from their next start"
+contexts = ["global", "workspace"]
+command = ["python3", "grazr.py", "pins-uninstall"]
 
 [[panes]]
 id = "enrol"

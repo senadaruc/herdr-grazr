@@ -47,6 +47,7 @@ above carry the rest.
 [Install](#install) ·
 [When the server refuses an account](#when-the-server-refuses-an-account) ·
 [Swap on demand](#swap-on-demand) ·
+[Pin an agent to an account](#pin-an-agent-to-an-account) ·
 [After a swap](#after-a-swap) ·
 [What it will not do](#what-it-will-not-do) ·
 [Policy](#policy)
@@ -294,6 +295,48 @@ Naming the account you are on, one nobody enrolled, or one the server refused
 until you enrol it again, swaps nothing and says so. If the account you name is below a threshold, the next message moves you
 on again, unless `ENABLED=0`. Herdr actions take no arguments, so this one is
 for scripts and for clients that let you pick the account.
+
+## Pin an agent to an account
+
+Every Claude pane shares the one login *grazr* rotates. To give one agent a
+subscription of its own, pin its pane to an enrolled account. Claude there runs
+on that account's own token and never rotates. *grazr* records its usage under
+that account and says once a window when it runs low.
+
+Once, install the shim. It goes first on PATH in Herdr panes only (a marked
+block at the end of `~/.zshrc` / `~/.bashrc`), so the pin holds across a Herdr
+restart and a `claude --resume` too:
+
+```sh
+herdr plugin action invoke wazum.grazr.pins-install
+```
+
+The rest takes arguments, which a Herdr action cannot, so it runs like the
+named swap above: with the directories Herdr would hand it (the `grazr` here
+stands for that whole command line). For each account you want to pin to, let
+Claude make a token that lasts a year. Sign in to claude.ai as that account in
+your browser first:
+
+```sh
+grazr token personal
+```
+
+Then pin a pane, by its Herdr pane id. Claude there moves at its next start:
+
+```sh
+grazr pin w1:p3 personal
+grazr unpin w1:p3
+```
+
+HerdrM does all of this from an agent's menu and the Accounts window.
+
+`PINNED_ROTATION=exclude` (the default) keeps a pinned account to its agent:
+the shared rotation never moves to it, and pinning the account the others are
+on moves them off it. `keep` leaves it in the shared rotation too.
+
+The token sits in the environment of that agent's Claude, so every tool it runs
+can read it, as it can read Claude's own login file on Linux. A pane whose pin
+has no current token starts Claude on the shared account and says so.
 
 ## After a swap
 

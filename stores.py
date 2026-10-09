@@ -71,8 +71,25 @@ class FileStore:
             return False
         return True
 
+    def read_token(self, account_id):
+        return self._read(self._token_path(account_id))
+
+    def write_token(self, account_id, token):
+        os.makedirs(os.path.dirname(self._token_path(account_id)), mode=0o700, exist_ok=True)
+        self._write(self._token_path(account_id), token)
+
+    def discard_token(self, account_id):
+        try:
+            os.unlink(self._token_path(account_id))
+        except FileNotFoundError:
+            pass
+
     def _parked_path(self, account_id):
         return os.path.join(self.parked_dir, account_id + ".json")
+
+    def _token_path(self, account_id):
+        """Beside the parked logins, where the shim looks for it."""
+        return token_path(os.path.dirname(self.parked_dir), account_id)
 
     def _isolated_path(self, config_dir):
         return os.path.join(config_dir, ".credentials.json")
@@ -98,6 +115,16 @@ def default_store(isolated, config_dir, state_dir, keychain_account):
         os.path.join(config_dir, ".credentials.json"),
         os.path.join(state_dir, "credentials"),
     )
+
+
+def token_path(state_dir, account_id):
+    """Where Linux keeps an account's pin token."""
+    return os.path.join(state_dir, "tokens", account_id)
+
+
+def token_service(account_id):
+    """The keychain item for an account's pin token."""
+    return "grazr-token-%s" % account_id
 
 
 def service_name(config_dir=None):
@@ -157,6 +184,25 @@ class KeychainStore:
             return getattr(completed, "returncode", 0) in (0, ITEM_NOT_FOUND)
         except (OSError, subprocess.TimeoutExpired):
             return False
+
+    def read_token(self, account_id):
+        return self._read(token_service(account_id))
+
+    def write_token(self, account_id, token):
+        self._install(token_service(account_id), token)
+
+    def discard_token(self, account_id):
+        try:
+            completed = self._spawn(
+                [SECURITY_BIN, "delete-generic-password", "-s", token_service(account_id),
+                 "-a", self.keychain_account],
+                capture_output=True,
+                timeout=SECURITY_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("The keychain did not answer within %ds" % SECURITY_TIMEOUT_SECONDS)
+        if getattr(completed, "returncode", 0) not in (0, ITEM_NOT_FOUND):
+            raise RuntimeError("The keychain refused to delete the token")
 
     def _parked_service(self, account_id):
         return "grazr-%s" % account_id

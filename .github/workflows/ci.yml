@@ -61,7 +61,7 @@ jobs:
                       return real.now(tz) + _shift
 
               datetime.datetime = Shifted
-              for name in [n for n in list(sys.modules) if n in ("test_grazr", "grazr", "claude", "core")]:
+              for name in [n for n in list(sys.modules) if n in ("test_grazr", "grazr", "claude", "core", "pins", "shim")]:
                   del sys.modules[name]
               import test_grazr
 
@@ -102,6 +102,8 @@ jobs:
           assert sorted(pane["id"] for pane in manifest["panes"]) == ["enrol", "status"]
           assert sorted(action["id"] for action in manifest["actions"]) == [
               "install",
+              "pins-install",
+              "pins-uninstall",
               "swap",
               "tag",
               "uninstall",
@@ -161,7 +163,7 @@ jobs:
                       names = [(node.module or "").split(".")[0]]
                   for name in names:
                       assert (
-                          name in ("core", "atomic", "accounts", "claude", "grazr", "stores")
+                          name in ("core", "atomic", "accounts", "claude", "grazr", "pins", "shim", "stores")
                           or name in __import__("sys").stdlib_module_names
                       ), "%s imports non-stdlib %s" % (path, name)
 
