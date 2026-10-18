@@ -4,6 +4,14 @@ Notable changes to *grazr*, newest first. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.4.7+senad.4 - 2026-10-18
+
+### Added
+
+- `grazr.py set ACCOUNTS "<names>"` changes the rotation order from a script or
+  another client, checking every name is enrolled. HerdrM uses it to keep
+  several hosts on one order.
+
 ## 0.4.7+senad.3 - 2026-10-09
 
 ### Added

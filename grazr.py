@@ -1428,7 +1428,7 @@ def _dispatch(argv):
     if command not in entry_points:
         print("usage: grazr.py %s" % "|".join(
             list(entry_points) + ["pin PANE ACCOUNT", "unpin PANE", "token ACCOUNT",
-                                  "token-forget ACCOUNT", "set PINNED_ROTATION exclude|keep"]
+                                  "token-forget ACCOUNT", "set ACCOUNTS|PINNED_ROTATION VALUE"]
         ), file=sys.stderr)
         return 2
     return entry_points[command]()
@@ -1831,17 +1831,33 @@ def token_forget(runtime=None, target=None):
     return 0
 
 
-SETTABLE = {"PINNED_ROTATION": pins.ROTATION_MODES}
+SETTABLE = {"ACCOUNTS": None, "PINNED_ROTATION": pins.ROTATION_MODES}
 
 
-def set_setting(key, value, path=None):
+def set_setting(key, value, path=None, enrolled=None):
     """Change one setting in config.env, keeping every other line as it is."""
     if key not in SETTABLE:
         print("grazr: only %s can be set this way" % ", ".join(SETTABLE))
         return 1
-    if value not in SETTABLE[key]:
+    if key == "ACCOUNTS":
+        names = value.split()
+        if enrolled is None:
+            enrolled = [entry.name for entry in accounts.load(_paths()[0], [])]
+        unknown = [name for name in names if name not in enrolled]
+        if unknown:
+            print("grazr: ACCOUNTS names must be enrolled accounts: %s" % " ".join(unknown))
+            return 1
+        twice = [name for index, name in enumerate(names) if name in names[:index]]
+        if twice:
+            print("grazr: ACCOUNTS lists an account twice: %s" % twice[0])
+            return 1
+        value = " ".join(names)
+        written = '"%s"' % value
+    elif value not in SETTABLE[key]:
         print("grazr: %s must be %s" % (key, " or ".join(SETTABLE[key])))
         return 1
+    else:
+        written = value
     path = path or _config_path()
     load_config(path)
     with open(path) as handle:
@@ -1850,12 +1866,12 @@ def set_setting(key, value, path=None):
     for index, line in enumerate(lines):
         if line.split("=", 1)[0].strip() == key:
             comment = line[line.index("#"):].rstrip("\n") if "#" in line else ""
-            lines[index] = ("%s=%s  %s" % (key, value, comment)).rstrip() + "\n"
+            lines[index] = ("%s=%s  %s" % (key, written, comment)).rstrip() + "\n"
             replaced = True
     if not replaced:
         if lines and not lines[-1].endswith("\n"):
             lines[-1] += "\n"
-        lines.append("%s=%s\n" % (key, value))
+        lines.append("%s=%s\n" % (key, written))
     atomic.write(path, "".join(lines))
     print("%s=%s" % (key, value))
     return 0

@@ -4655,8 +4655,29 @@ class PinnedRotationSettingTest(unittest.TestCase):
         self.write('ACCOUNTS="a"\n')
 
         with contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(grazr.set_setting("ACCOUNTS", "b", self.path), 1)
+            self.assertEqual(grazr.set_setting("ACCOUNTS", "b", self.path, enrolled=["a"]), 1)
             self.assertEqual(grazr.set_setting("PINNED_ROTATION", "maybe", self.path), 1)
+
+    def test_set_accounts_writes_a_quoted_list_of_enrolled_names(self):
+        self.write('ACCOUNTS="a"  # order\nPINNED_ROTATION=exclude\n')
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(grazr.set_setting("ACCOUNTS", "b a", self.path, enrolled=["a", "b"]), 0)
+        with open(self.path) as handle:
+            self.assertEqual(handle.read(), 'ACCOUNTS="b a"  # order\nPINNED_ROTATION=exclude\n')
+        self.assertEqual(grazr.load_config(self.path).accounts, ["b", "a"])
+
+    def test_set_accounts_refuses_unknown_and_duplicate_names(self):
+        self.write('ACCOUNTS="a"\n')
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(grazr.set_setting("ACCOUNTS", "a c", self.path, enrolled=["a", "b"]), 1)
+            self.assertEqual(grazr.set_setting("ACCOUNTS", "a a", self.path, enrolled=["a", "b"]), 1)
+        self.assertEqual(grazr.load_config(self.path).accounts, ["a"])
+
+    def test_set_accounts_accepts_the_empty_list(self):
+        self.write('ACCOUNTS="a"\n')
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(grazr.set_setting("ACCOUNTS", "", self.path, enrolled=["a"]), 0)
+        self.assertEqual(grazr.load_config(self.path).accounts, [])
 
 
 class PinsInstallTest(unittest.TestCase):
