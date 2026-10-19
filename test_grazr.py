@@ -2177,9 +2177,26 @@ class ActOnDecisionTest(unittest.TestCase):
                 "exhausted", self.runtime(), "uuid-work", limits
             )
 
-        self.act("exhausted", limits=limits)
+        with mock.patch.object(grazr, "NOTICE_RETRY_SECONDS", 0):
+            self.act("exhausted", limits=limits)
 
         self.assertEqual(len(self.notices), 1, "must announce again after a suppressed toast")
+
+    def test_a_suppressed_toast_is_not_retried_on_every_message(self):
+        """Each try is a herdr call and a forwarded OSC 777. A toast herdr
+        never shows, on every message of every pane, stalled a host."""
+        limits = [limit(group="session", remaining=0)]
+        tries = []
+        with mock.patch.object(grazr, "notify", lambda title, body: tries.append(title) and False):
+            for _ in range(5):
+                grazr.act_on("exhausted", self.runtime(), "uuid-work", limits)
+
+        self.assertEqual(len(tries), 1, tries)
+        with mock.patch.object(grazr, "NOTICE_RETRY_SECONDS", 0), mock.patch.object(
+            grazr, "notify", lambda title, body: tries.append(title) and False
+        ):
+            grazr.act_on("exhausted", self.runtime(), "uuid-work", limits)
+        self.assertEqual(len(tries), 2, "tried again once the wait is over")
 
     def test_a_rotation_clears_the_situation_it_resolved(self):
         """The marker is the dedupe key as well as the status line. Leaving
@@ -2691,6 +2708,19 @@ class StatuslineTest(EnrolledPairFixture):
             _, printed = self.invoke(grazr.status)
 
         self.assertIn("This login is not enrolled, so only a swap by hand moves off it", printed)
+
+    def test_a_previous_status_line_that_runs_grazr_is_never_run(self):
+        """A user's bar that calls grazr for one segment, saved as the previous
+        line, would call this shim back on every message: shells all the way
+        down until the host stalls."""
+        with open(os.path.join(self.state_dir, "statusline.previous.json"), "w") as handle:
+            json.dump({"previous": {"type": "command",
+                                    "command": "printf 'bar '; python3 /x/grazr.py statusline"},
+                       "shim": "python3 grazr.py statusline"}, handle)
+
+        _, printed = self.run_statusline(self.payload(used=10))
+
+        self.assertEqual(printed, "")
 
     def test_without_a_previous_status_line_the_bar_stays_empty(self):
         _, printed = self.run_statusline(self.payload(used=90))
@@ -3358,6 +3388,20 @@ class StatuslineInstallTest(unittest.TestCase):
         with open(self.record) as handle:
             self.assertEqual(json.load(handle), {"previous": old, "shim": "SHIM"})
         self.assertEqual(line, "Status line connected")
+
+    def test_a_bar_that_already_runs_grazr_is_left_alone(self):
+        """Wrapping it made grazr run the bar, which ran grazr: a fork storm
+        on every message (cloud-dev, 2026-10-19)."""
+        bar = {"type": "command",
+               "command": "input=$(cat); printf 'x'; g=$(echo \"$input\" | python3 /x/grazr.py statusline); printf '%s' \"$g\""}
+        self.write_settings({"statusLine": bar})
+
+        line = claude.install_statusline(self.directory, self.record, "SHIM")
+
+        self.assertEqual(self.read_settings()["statusLine"], bar)
+        self.assertFalse(os.path.exists(self.record))
+        self.assertIn("left alone", line)
+        self.assertTrue(claude.statusline_installed(self.directory, self.record))
 
     def test_a_setup_without_a_status_line_gets_one_that_refreshes_while_idle(self):
         claude.install_statusline(self.directory, self.record, "SHIM")

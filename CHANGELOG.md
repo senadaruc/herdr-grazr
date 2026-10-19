@@ -4,6 +4,19 @@ Notable changes to *grazr*, newest first. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Fixed
+
+- Connecting the status line leaves a status line that already runs grazr
+  alone, and the shim never runs a saved "previous" line that runs grazr.
+  Together they made every status-line message fork grazr, the user's bar,
+  grazr, the bar and so on until the host stalled (load 260 on 8 cores).
+  Adding an account runs the connect step, so re-enrolling an account on a
+  host whose own bar calls grazr for one segment was enough to start it.
+- A toast herdr did not show is tried again after a minute, not on every
+  message of every pane.
+
 ## 0.5.1 - 2026-10-15
 
 ### Fixed

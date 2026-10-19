@@ -62,6 +62,8 @@ CLOSE_KEYS = (ESCAPE, "q", "\r", "\n", "")
 
 # Telling the user is worth a moment, but not a stuck status line.
 NOTIFY_TIMEOUT_SECONDS = 5
+# A toast that did not appear is tried again, but not on every message.
+NOTICE_RETRY_SECONDS = 60
 # A rotation reports to every Claude pane, so none of them may hang.
 TAG_TIMEOUT_SECONDS = 5
 STATUSLINE_TIMEOUT_SECONDS = 5
@@ -230,7 +232,7 @@ def act_on(decision, runtime, active_id, limits, enrolled=(), now=None):
     notices = {
         key: seen for key, seen in _read_notices(state_dir).items() if key.startswith("unreadable:")
     }
-    notices[line] = shown
+    notices[line] = _notice_state(shown)
     _write_notices(state_dir, notices)
     return line
 
@@ -290,19 +292,39 @@ def _announce_once(state_dir, key, title, body):
     panes reaching a new situation together would both call it new, so the
     store is read and written under a lock. Every open situation is kept, or
     two of them would evict each other and toast in turns.
+
+    A toast that did not appear is tried again no sooner than
+    NOTICE_RETRY_SECONDS later: every try costs a herdr call and a forwarded
+    OSC 777, and a toast herdr never shows would otherwise cost that on every
+    message of every pane.
     """
     with _file_lock(os.path.join(state_dir, "notices.lock")) as held:
         if not held:
             return False
         notices = _read_notices(state_dir)
         if key in notices:
-            if not notices[key] and notify(title, body):
-                notices[key] = True
+            state = notices[key]
+            if state is not True and _now_ts() - _last_try(state) >= NOTICE_RETRY_SECONDS:
+                notices[key] = _notice_state(notify(title, body))
                 _write_notices(state_dir, notices)
             return False
-        notices[key] = notify(title, body)
+        notices[key] = _notice_state(notify(title, body))
         _write_notices(state_dir, notices)
         return True
+
+
+def _notice_state(shown):
+    """True once the toast appeared, else when it was last tried."""
+    return True if shown else _now_ts()
+
+
+def _last_try(state):
+    """Older stores hold False for a toast never shown."""
+    return state if isinstance(state, (int, float)) and state is not True else 0
+
+
+def _now_ts():
+    return datetime.now(timezone.utc).timestamp()
 
 
 def _read_notices(state_dir):
@@ -675,7 +697,9 @@ def _previous_bar(state_dir, payload, spawn):
             command = (json.load(handle)["previous"] or {}).get("command")
     except (OSError, ValueError, KeyError, AttributeError):
         return ""
-    if not command:
+    if not command or claude.runs_grazr(command):
+        # A bar that calls grazr itself would call this shim back: a chain
+        # of shells on every message until the host stalls.
         return ""
     try:
         return spawn(
