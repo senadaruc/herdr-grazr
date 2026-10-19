@@ -533,6 +533,10 @@ def install_statusline(config_dir, record_path, command):
     # Any grazr shim counts as ours. An upgrade that died between the two writes
     # leaves the old shim in the settings, and it is not the user's status line.
     ours_before = recorded and _is_ours(current, recorded)
+    if not ours_before and runs_grazr(current):
+        # The user's own bar calls grazr for its segment. Wrapping it would
+        # make grazr run the bar, which runs grazr, on every message.
+        return "Status line already runs grazr in your own bar, left alone"
     previous = recorded["previous"] if ours_before else current
     atomic.write(record_path, json.dumps({"previous": previous, "shim": command}))
     settings["statusLine"] = {
@@ -561,13 +565,26 @@ def uninstall_statusline(config_dir, record_path):
 
 
 def statusline_installed(config_dir, record_path):
+    """grazr's shim is in, or the user's own bar runs grazr: either way
+    every message reaches it."""
+    try:
+        current = _read_settings(config_dir).get("statusLine")
+    except RuntimeError:
+        return False
+    if runs_grazr(current):
+        return True
     recorded = _read_record(record_path)
     if recorded is None:
         return False
-    try:
-        return (_read_settings(config_dir).get("statusLine") or {}).get("command") == recorded["shim"]
-    except RuntimeError:
-        return False
+    return (current or {}).get("command") == recorded["shim"]
+
+
+def runs_grazr(entry):
+    """A status line, or its command, that invokes grazr's own status line
+    somewhere in it, whether it is the shim or a bar of the user's that
+    calls grazr for one segment."""
+    command = entry.get("command", "") if isinstance(entry, dict) else (entry or "")
+    return "grazr.py" in command and "statusline" in command
 
 
 # The StopFailure errors that say the account itself is the problem. Claude
