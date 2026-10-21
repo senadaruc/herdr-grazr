@@ -57,7 +57,7 @@ _THRESHOLD_KEYS = {"REMAINING_SESSION": ("session", 15), "REMAINING_WEEKLY": ("w
 _FLAG_KEYS = (("ENABLED", True), ("DRY_RUN", False), ("MODEL_LIMITS", False))
 
 LOG = "grazr.log"
-PREVIOUS_STATUSLINE = "statusline.previous.json"
+PREVIOUS_STATUSLINE = claude.PREVIOUS_STATUSLINE
 UNREADABLE_PENDING = "statusline.unreadable.json"
 # Only a live session can miss twice, so the armed set never needs to be large.
 UNREADABLE_PENDING_CAP = 64
@@ -1479,6 +1479,9 @@ def _dispatch(argv):
         "refresh": refresh, "pins-install": pins_install, "pins-uninstall": pins_uninstall,
     }
     command = argv[1] if len(argv) > 1 else ""
+    if command == "install" and len(argv) == 3 and argv[2] == "--force":
+        # Takes over a status line or hook that belongs to another grazr.
+        return install(force=True)
     # Commands with arguments, from the Accounts window or a script.
     with_arguments = {
         ("pin", 4): lambda: pin(pane_id=argv[2], target=argv[3]),
@@ -1495,9 +1498,9 @@ def _dispatch(argv):
     if command == "swap" and len(argv) == 3:
         # A named account, from a script or another client. The action passes none.
         return swap(target=argv[2])
-    if command not in entry_points:
+    if command not in entry_points or (command == "install" and len(argv) != 2):
         print("usage: grazr.py %s" % "|".join(
-            list(entry_points) + ["pin PANE ACCOUNT", "unpin PANE", "token ACCOUNT",
+            list(entry_points) + ["install --force", "pin PANE ACCOUNT", "unpin PANE", "token ACCOUNT",
                                   "token-forget ACCOUNT", "set ACCOUNTS|PINNED_ROTATION VALUE"]
         ), file=sys.stderr)
         return 2
@@ -1535,17 +1538,23 @@ def tag(runtime=None):
     return 0
 
 
-def install(runtime=None):
+def install(runtime=None, force=False):
     paths, _, state_dir, _ = runtime or _runtime()
-    print(claude.install_statusline(paths.config_dir, _record_path(state_dir), _shim_command(state_dir)))
-    print(claude.install_failure_hook(paths.config_dir, _failure_command(state_dir)))
+    shim = _shim_command(state_dir)
+    hook = _failure_command(state_dir)
+    other = claude.foreign_owner(paths.config_dir, shim, hook)
+    if other and not force:
+        print("grazr: Claude's status line or StopFailure hook already belongs to another grazr (state in %s); disconnect it there, or run install --force to take it over" % other)
+        return 1
+    print(claude.install_statusline(paths.config_dir, _record_path(state_dir), shim, force=force))
+    print(claude.install_failure_hook(paths.config_dir, hook, force=force))
     return 0
 
 
 def uninstall(runtime=None):
     paths, _, state_dir, _ = runtime or _runtime()
     print(claude.uninstall_statusline(paths.config_dir, _record_path(state_dir)))
-    print(claude.uninstall_failure_hook(paths.config_dir))
+    print(claude.uninstall_failure_hook(paths.config_dir, _failure_command(state_dir)))
     return 0
 
 
@@ -1688,9 +1697,17 @@ def status(runtime=None):
 
     print("\nactive account headroom: %s" % _describe(_latest_reading(paths, active)))
     if not claude.statusline_installed(paths.config_dir, _record_path(state_dir)):
-        print("  The status line is not grazr's, so grazr sees no usage. Run the connect action")
+        other = claude.foreign_statusline(paths.config_dir, _shim_command(state_dir))
+        if other:
+            print("  The status line belongs to another grazr (state in %s). Run install --force to take it over" % other)
+        else:
+            print("  The status line is not grazr's, so grazr sees no usage. Run the connect action")
     if not claude.failure_hook_installed(paths.config_dir, _failure_command(state_dir)):
-        print("  The failure hook is not connected, so an account the server refuses stays put. Run the connect action")
+        other = claude.foreign_failure_hook(paths.config_dir, _failure_command(state_dir))
+        if other:
+            print("  The failure hook belongs to another grazr (state in %s). Run install --force to take it over" % other)
+        else:
+            print("  The failure hook is not connected, so an account the server refuses stays put. Run the connect action")
     if active and not any(account.id == active for account in enrolled):
         # Enrolled but left out of ACCOUNTS is the likelier mistake, and calling
         # that "not enrolled" sends you off to enrol it a second time.
@@ -1806,8 +1823,12 @@ def _enrol_from(runtime, source):
     if _unblock(state_dir, identifier, datetime.now(timezone.utc)):
         print("It had failed before, and is back in rotation")
     print('Add it to ACCOUNTS in %s' % _config_path())
-    print(claude.install_statusline(paths.config_dir, _record_path(state_dir), _shim_command(state_dir)))
-    print(claude.install_failure_hook(paths.config_dir, _failure_command(state_dir)))
+    try:
+        print(claude.install_statusline(paths.config_dir, _record_path(state_dir), _shim_command(state_dir)))
+        print(claude.install_failure_hook(paths.config_dir, _failure_command(state_dir)))
+    except RuntimeError as error:
+        # Enrolling worked. The status line or hook is another grazr's to keep.
+        print("grazr: %s" % error)
     return 0
 
 

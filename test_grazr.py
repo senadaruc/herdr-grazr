@@ -3443,6 +3443,68 @@ class ShimCommandTest(unittest.TestCase):
         self.assertEqual(failure, status[: -len("statusline")] + "failure")
 
 
+class ShimPartsTest(unittest.TestCase):
+    """Which command is grazr's own shim, and whose state dir it carries. That
+    decides who owns Claude's status line and StopFailure hook."""
+
+    def test_the_grazr_pair_is_read(self):
+        self.assertEqual(
+            claude.shim_parts("GRAZR_STATE_DIR=/s GRAZR_CONFIG_DIR=/c python3 /p/grazr.py statusline"),
+            ("statusline", "/s"),
+        )
+
+    def test_herdrs_pair_is_read_for_the_failure_twin(self):
+        self.assertEqual(
+            claude.shim_parts("HERDR_PLUGIN_STATE_DIR=/s HERDR_PLUGIN_CONFIG_DIR=/c python3 /p/grazr.py failure"),
+            ("failure", "/s"),
+        )
+
+    def test_the_notifier_is_allowed_before_python(self):
+        self.assertEqual(
+            claude.shim_parts("HERDR_PLUGIN_STATE_DIR=/s GRAZR_NOTIFIER=queue,osascript python3 /p/grazr.py statusline"),
+            ("statusline", "/s"),
+        )
+
+    def test_quoted_values_are_unquoted(self):
+        self.assertEqual(
+            claude.shim_parts("GRAZR_STATE_DIR='/a b' python3 '/p q/grazr.py' statusline"),
+            ("statusline", "/a b"),
+        )
+
+    def test_a_shim_without_a_state_dir_carries_the_empty_string(self):
+        self.assertEqual(claude.shim_parts("python3 /p/grazr.py statusline"), ("statusline", ""))
+
+    def test_a_status_line_entry_is_read_by_its_command(self):
+        entry = {"type": "command", "command": "HERDR_PLUGIN_STATE_DIR=/s python3 /p/grazr.py statusline"}
+
+        self.assertEqual(claude.shim_parts(entry), ("statusline", "/s"))
+
+    def test_anything_else_is_not_a_shim(self):
+        for command in (
+            "input=$(cat); printf x; python3 /x/grazr.py statusline",
+            "python3 /p/grazr.py statusline extra",
+            "python3 /p/grazr.py decide",
+            "python3 '/p/grazr.py statusline",
+            "FOO=1 python3 /p/grazr.py statusline",
+            "",
+            None,
+            ["python3", "/p/grazr.py", "statusline"],
+        ):
+            with self.subTest(command=command):
+                self.assertIsNone(claude.shim_parts(command))
+
+    def test_owners_are_the_same_when_the_state_dir_is(self):
+        self.assertTrue(claude.same_owner(
+            "HERDR_PLUGIN_STATE_DIR=/s python3 /a/grazr.py statusline",
+            "GRAZR_STATE_DIR=/s python3 /b/grazr.py failure",
+        ))
+        self.assertFalse(claude.same_owner(
+            "HERDR_PLUGIN_STATE_DIR=/s python3 /a/grazr.py statusline",
+            "HERDR_PLUGIN_STATE_DIR=/o python3 /a/grazr.py statusline",
+        ))
+        self.assertFalse(claude.same_owner("mine", "mine"))
+
+
 class ConnectTest(EnrolledPairFixture):
     """Connecting grazr to Claude's status line, from the enrol pane or the
     action, and noticing when it has come loose."""
@@ -3502,6 +3564,175 @@ class ConnectTest(EnrolledPairFixture):
 
         self.assertEqual((code, enrolled), (1, []))
         self.assertIn("Busy", printed)
+
+    def test_install_with_force_reaches_install_with_force(self):
+        seen = []
+        with mock.patch.object(grazr, "install", lambda runtime=None, force=False: seen.append(force) or 0):
+            code = grazr._dispatch(["grazr.py", "install", "--force"])
+
+        self.assertEqual((code, seen), (0, [True]))
+
+    def test_install_with_any_other_argument_prints_usage(self):
+        with mock.patch.object(grazr, "install", lambda runtime=None, force=False: self.fail("ran install")), \
+             contextlib.redirect_stderr(io.StringIO()) as usage:
+            code = grazr._dispatch(["grazr.py", "install", "--yes"])
+
+        self.assertEqual(code, 2)
+        self.assertIn("install --force", usage.getvalue())
+
+    def test_status_says_when_another_grazr_holds_the_slots(self):
+        other = os.path.join(self.directory, "other")
+        self.write_settings(self.another_grazr(other))
+
+        _, printed = self.invoke(grazr.status)
+
+        self.assertIn("The status line belongs to another grazr (state in %s)" % other, printed)
+        self.assertIn("The failure hook belongs to another grazr (state in %s)" % other, printed)
+        self.assertIn("install --force", printed)
+
+    def test_enrolling_next_to_another_grazr_enrols_and_leaves_its_slots(self):
+        other = os.path.join(self.directory, "other")
+        self.write_settings(self.another_grazr(other))
+        before = self.raw_settings()
+
+        with mock.patch.object(claude, "enrol", lambda *arguments: "uuid-third"), \
+             mock.patch("builtins.input", lambda prompt: "third"):
+            code, printed = self.invoke(lambda runtime: grazr._enrol_from(runtime, None))
+
+        self.assertEqual(code, 0)
+        self.assertIn("Enrolled third as uuid-third", printed)
+        self.assertIn("another grazr", printed)
+        self.assertEqual(self.raw_settings(), before)
+
+    def write_settings(self, settings):
+        with open(os.path.join(self.claude_dir, "settings.json"), "w") as handle:
+            json.dump(settings, handle)
+
+    def raw_settings(self):
+        with open(os.path.join(self.claude_dir, "settings.json"), "rb") as handle:
+            return handle.read()
+
+    def record(self):
+        with open(grazr._record_path(self.state_dir)) as handle:
+            return json.load(handle)
+
+    def write_other_record(self, other, previous):
+        """What the other grazr kept when it took the slot, in its own state dir."""
+        os.makedirs(other, exist_ok=True)
+        with open(os.path.join(other, grazr.PREVIOUS_STATUSLINE), "w") as handle:
+            json.dump({"previous": previous, "shim": "unused"}, handle)
+
+    def another_grazr(self, other):
+        """Settings as another grazr (Orca's, say) left them: its status line and
+        its StopFailure group, each carrying its own state dir."""
+        quoted = shlex.quote(other)
+        failure = "HERDR_PLUGIN_STATE_DIR=%s HERDR_PLUGIN_CONFIG_DIR=/elsewhere python3 /elsewhere/grazr.py failure" % quoted
+        return {
+            "statusLine": {
+                "type": "command",
+                "command": failure[: -len("failure")] + "statusline",
+                "refreshInterval": 60,
+            },
+            "hooks": {"StopFailure": [
+                {"matcher": claude.FAILURE_HOOK_MATCHER, "hooks": [{"type": "command", "command": failure}]},
+            ]},
+        }
+
+    def test_install_refuses_while_another_grazr_owns_the_slots(self):
+        """Herdr's and Orca's grazr share one settings.json. Installing over the
+        other one would take its slot without a word."""
+        other = os.path.join(self.directory, "other")
+        self.write_settings(self.another_grazr(other))
+        before = self.raw_settings()
+
+        code, printed = self.invoke(grazr.install)
+
+        self.assertEqual(code, 1)
+        self.assertIn("another grazr", printed)
+        self.assertIn(other, printed)
+        self.assertEqual(self.raw_settings(), before)
+        self.assertFalse(os.path.exists(grazr._record_path(self.state_dir)))
+
+    def test_force_takes_the_slots_and_keeps_the_bar_the_other_grazr_kept(self):
+        other = os.path.join(self.directory, "other")
+        self.write_other_record(other, {"type": "command", "command": "printf x"})
+        orca = {"matcher": "", "hooks": [{"type": "command", "command": "/x/orca-hook.sh"}]}
+        settings = self.another_grazr(other)
+        settings["hooks"]["StopFailure"].append(orca)
+        self.write_settings(settings)
+
+        code, _ = self.invoke(lambda runtime: grazr.install(runtime, force=True))
+
+        groups = self.settings()["hooks"]["StopFailure"]
+        ours = [group for group in groups if group != orca]
+        self.assertEqual(code, 0)
+        self.assertEqual(self.record()["previous"], {"type": "command", "command": "printf x"})
+        self.assertEqual(len(ours), 1)
+        self.assertIn(shlex.quote(self.state_dir), ours[0]["hooks"][0]["command"])
+        self.assertIn(orca, groups)
+
+    def test_force_does_not_keep_a_previous_bar_that_runs_grazr(self):
+        other = os.path.join(self.directory, "other")
+        self.write_other_record(other, {"type": "command", "command": "input=$(cat); python3 /x/grazr.py statusline"})
+        self.write_settings(self.another_grazr(other))
+
+        self.invoke(lambda runtime: grazr.install(runtime, force=True))
+
+        self.assertIsNone(self.record()["previous"])
+
+    def test_a_bar_that_embeds_another_grazr_is_left_alone_even_with_force(self):
+        bar = {"type": "command", "command":
+               "input=$(cat); g=$(echo \"$input\" | HERDR_PLUGIN_STATE_DIR=/other python3 /x/grazr.py statusline); printf '%s' \"$g\""}
+        for force in (False, True):
+            with self.subTest(force=force):
+                self.write_settings({"statusLine": bar})
+
+                _, printed = self.invoke(lambda runtime: grazr.install(runtime, force=force))
+
+                self.assertEqual(self.settings()["statusLine"], bar)
+                self.assertIn("left alone", printed)
+
+    def test_uninstall_leaves_another_grazrs_slots_and_our_record_alone(self):
+        self.invoke(grazr.install)
+        other = os.path.join(self.directory, "other")
+        self.write_settings(self.another_grazr(other))
+        before = self.raw_settings()
+
+        _, printed = self.invoke(grazr.uninstall)
+
+        self.assertEqual(self.raw_settings(), before)
+        self.assertIn("left alone", printed)
+        self.assertTrue(os.path.exists(grazr._record_path(self.state_dir)))
+
+    def test_status_line_installed_follows_the_state_dir_not_the_path(self):
+        self.invoke(grazr.install)
+        ours = self.settings()["statusLine"]["command"]
+        record = grazr._record_path(self.state_dir)
+        other = os.path.join(self.directory, "other")
+
+        def installed_with(command):
+            self.write_settings({"statusLine": {"type": "command", "command": command}})
+            return claude.statusline_installed(self.claude_dir, record)
+
+        user_bar = "input=$(cat); g=$(echo \"$input\" | %s python3 /x/grazr.py statusline); printf '%%s' \"$g\""
+        self.assertTrue(installed_with(ours))
+        self.assertFalse(installed_with(self.another_grazr(other)["statusLine"]["command"]))
+        self.assertFalse(installed_with(user_bar % ("HERDR_PLUGIN_STATE_DIR=" + shlex.quote(other))))
+        self.assertTrue(installed_with(user_bar % ("HERDR_PLUGIN_STATE_DIR=" + shlex.quote(self.state_dir))))
+        self.assertTrue(installed_with(user_bar % ""))
+        os.remove(record)
+        self.assertFalse(installed_with(ours))
+
+    def test_an_older_checkout_of_our_own_install_is_re_adopted_without_its_record(self):
+        """A plugin checked out at a new path, whose record is gone, reinstalls
+        as ours rather than passing as connected."""
+        self.write_settings({"statusLine": {"type": "command", "command":
+            "HERDR_PLUGIN_STATE_DIR=%s python3 /old/grazr.py statusline" % shlex.quote(self.state_dir)}})
+
+        _, printed = self.invoke(grazr.install)
+
+        self.assertIn("Status line connected", printed)
+        self.assertIsNone(self.record()["previous"])
 
 
 # Captured from Claude Code 2.1.261, trimmed to the fields around the limits.
@@ -3567,6 +3798,10 @@ class StatuslineInstallTest(unittest.TestCase):
     """grazr takes over Claude's status line and keeps what was there, so the
     bar the user set up still shows and comes back on uninstall."""
 
+    SHIM = "HERDR_PLUGIN_STATE_DIR=/s python3 /p/grazr.py statusline"
+    MOVED = "HERDR_PLUGIN_STATE_DIR=/s python3 /q/grazr.py statusline"
+    OTHER = "HERDR_PLUGIN_STATE_DIR=/other python3 /x/grazr.py statusline"
+
     def setUp(self):
         self.directory = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.directory, True)
@@ -3585,14 +3820,14 @@ class StatuslineInstallTest(unittest.TestCase):
         old = {"type": "command", "command": "old-bar", "refreshInterval": 30}
         self.write_settings({"theme": "dark", "statusLine": old})
 
-        line = claude.install_statusline(self.directory, self.record, "SHIM")
+        line = claude.install_statusline(self.directory, self.record, self.SHIM)
 
         self.assertEqual(self.read_settings(), {
             "theme": "dark",
-            "statusLine": {"type": "command", "command": "SHIM", "refreshInterval": 30},
+            "statusLine": {"type": "command", "command": self.SHIM, "refreshInterval": 30},
         })
         with open(self.record) as handle:
-            self.assertEqual(json.load(handle), {"previous": old, "shim": "SHIM"})
+            self.assertEqual(json.load(handle), {"previous": old, "shim": self.SHIM})
         self.assertEqual(line, "Status line connected")
 
     def test_a_bar_that_already_runs_grazr_is_left_alone(self):
@@ -3602,7 +3837,7 @@ class StatuslineInstallTest(unittest.TestCase):
                "command": "input=$(cat); printf 'x'; g=$(echo \"$input\" | python3 /x/grazr.py statusline); printf '%s' \"$g\""}
         self.write_settings({"statusLine": bar})
 
-        line = claude.install_statusline(self.directory, self.record, "SHIM")
+        line = claude.install_statusline(self.directory, self.record, self.SHIM)
 
         self.assertEqual(self.read_settings()["statusLine"], bar)
         self.assertFalse(os.path.exists(self.record))
@@ -3610,24 +3845,24 @@ class StatuslineInstallTest(unittest.TestCase):
         self.assertTrue(claude.statusline_installed(self.directory, self.record))
 
     def test_a_setup_without_a_status_line_gets_one_that_refreshes_while_idle(self):
-        claude.install_statusline(self.directory, self.record, "SHIM")
+        claude.install_statusline(self.directory, self.record, self.SHIM)
 
         self.assertEqual(
             self.read_settings()["statusLine"],
-            {"type": "command", "command": "SHIM", "refreshInterval": 60},
+            {"type": "command", "command": self.SHIM, "refreshInterval": 60},
         )
 
     def test_installing_again_keeps_the_original_previous(self):
         self.write_settings({"statusLine": {"type": "command", "command": "old-bar"}})
-        claude.install_statusline(self.directory, self.record, "SHIM")
+        claude.install_statusline(self.directory, self.record, self.SHIM)
 
-        line = claude.install_statusline(self.directory, self.record, "SHIM-MOVED")
+        line = claude.install_statusline(self.directory, self.record, self.MOVED)
 
         with open(self.record) as handle:
             self.assertEqual(json.load(handle)["previous"]["command"], "old-bar")
         self.assertEqual(
             (self.read_settings()["statusLine"]["command"], line),
-            ("SHIM-MOVED", "Status line connected"),
+            (self.MOVED, "Status line connected"),
         )
 
     def test_an_upgrade_that_died_writing_settings_keeps_the_original(self):
@@ -3646,17 +3881,17 @@ class StatuslineInstallTest(unittest.TestCase):
                          ("old-bar", "Status line disconnected"))
 
     def test_installing_the_same_shim_twice_changes_nothing(self):
-        claude.install_statusline(self.directory, self.record, "SHIM")
+        claude.install_statusline(self.directory, self.record, self.SHIM)
 
         self.assertEqual(
-            claude.install_statusline(self.directory, self.record, "SHIM"),
+            claude.install_statusline(self.directory, self.record, self.SHIM),
             "Status line already connected",
         )
 
     def test_uninstall_restores_what_was_there(self):
         old = {"type": "command", "command": "old-bar"}
         self.write_settings({"statusLine": old})
-        claude.install_statusline(self.directory, self.record, "SHIM")
+        claude.install_statusline(self.directory, self.record, self.SHIM)
 
         line = claude.uninstall_statusline(self.directory, self.record)
 
@@ -3665,14 +3900,14 @@ class StatuslineInstallTest(unittest.TestCase):
 
     def test_uninstall_removes_an_entry_that_was_not_there_before(self):
         self.write_settings({"theme": "dark"})
-        claude.install_statusline(self.directory, self.record, "SHIM")
+        claude.install_statusline(self.directory, self.record, self.SHIM)
 
         claude.uninstall_statusline(self.directory, self.record)
 
         self.assertEqual(self.read_settings(), {"theme": "dark"})
 
     def test_uninstall_leaves_a_status_line_the_user_replaced_by_hand(self):
-        claude.install_statusline(self.directory, self.record, "SHIM")
+        claude.install_statusline(self.directory, self.record, self.SHIM)
         self.write_settings({"statusLine": {"type": "command", "command": "mine"}})
 
         line = claude.uninstall_statusline(self.directory, self.record)
@@ -3684,17 +3919,37 @@ class StatuslineInstallTest(unittest.TestCase):
 
     def test_it_knows_whether_it_is_connected(self):
         self.assertFalse(claude.statusline_installed(self.directory, self.record))
-        claude.install_statusline(self.directory, self.record, "SHIM")
+        claude.install_statusline(self.directory, self.record, self.SHIM)
         self.assertTrue(claude.statusline_installed(self.directory, self.record))
         self.write_settings({"statusLine": {"type": "command", "command": "mine"}})
         self.assertFalse(claude.statusline_installed(self.directory, self.record))
+
+    def test_it_refuses_a_shim_that_belongs_to_another_state_dir(self):
+        self.write_settings({"statusLine": {"type": "command", "command": self.OTHER}})
+
+        with self.assertRaises(RuntimeError) as caught:
+            claude.install_statusline(self.directory, self.record, self.SHIM)
+
+        self.assertIn("another grazr", str(caught.exception))
+        self.assertEqual(self.read_settings()["statusLine"]["command"], self.OTHER)
+        self.assertFalse(os.path.exists(self.record))
+
+    def test_force_takes_a_foreign_slot_and_keeps_no_previous_it_cannot_read(self):
+        self.write_settings({"statusLine": {"type": "command", "command": self.OTHER}})
+
+        line = claude.install_statusline(self.directory, self.record, self.SHIM, force=True)
+
+        with open(self.record) as handle:
+            self.assertEqual(json.load(handle), {"previous": None, "shim": self.SHIM})
+        self.assertEqual((self.read_settings()["statusLine"]["command"], line),
+                         (self.SHIM, "Status line connected"))
 
     def test_a_settings_file_that_is_not_json_is_not_touched(self):
         with open(self.settings, "w") as handle:
             handle.write("{ not json")
 
         with self.assertRaises(RuntimeError):
-            claude.install_statusline(self.directory, self.record, "SHIM")
+            claude.install_statusline(self.directory, self.record, self.SHIM)
 
         with open(self.settings) as handle:
             self.assertEqual(handle.read(), "{ not json")
@@ -4354,7 +4609,7 @@ class FailureHookInstallTest(unittest.TestCase):
         self.assertEqual(len(self.read()["hooks"]["StopFailure"]), 1)
 
     def test_a_checkout_at_a_new_path_replaces_the_old_hook(self):
-        self.write({"hooks": {"StopFailure": [self.ours("python3 /old/grazr.py failure")]}})
+        self.write({"hooks": {"StopFailure": [self.ours("HERDR_PLUGIN_STATE_DIR=/s python3 /old/grazr.py failure")]}})
 
         claude.install_failure_hook(self.config_dir, self.COMMAND)
 
@@ -4364,21 +4619,21 @@ class FailureHookInstallTest(unittest.TestCase):
         theirs = {"hooks": [{"type": "command", "command": "notify-me"}]}
         self.write({"hooks": {"StopFailure": [theirs, self.ours()]}})
 
-        self.assertEqual(claude.uninstall_failure_hook(self.config_dir), "Failure hook disconnected")
+        self.assertEqual(claude.uninstall_failure_hook(self.config_dir, self.COMMAND), "Failure hook disconnected")
 
         self.assertEqual(self.read()["hooks"]["StopFailure"], [theirs])
 
     def test_uninstall_leaves_no_empty_shell(self):
         self.write({"hooks": {"StopFailure": [self.ours()]}, "model": "x"})
 
-        claude.uninstall_failure_hook(self.config_dir)
+        claude.uninstall_failure_hook(self.config_dir, self.COMMAND)
 
         self.assertEqual(self.read(), {"model": "x"})
 
     def test_uninstall_without_it_says_so(self):
         self.write({"model": "x"})
 
-        self.assertEqual(claude.uninstall_failure_hook(self.config_dir), "Failure hook was not connected")
+        self.assertEqual(claude.uninstall_failure_hook(self.config_dir, self.COMMAND), "Failure hook was not connected")
 
     def test_hooks_it_cannot_read_are_not_touched(self):
         self.write({"hooks": ["weird"]})
@@ -4386,6 +4641,51 @@ class FailureHookInstallTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             claude.install_failure_hook(self.config_dir, self.COMMAND)
         self.assertEqual(self.read(), {"hooks": ["weird"]})
+
+    def test_it_refuses_a_group_that_belongs_to_another_state_dir(self):
+        orca = {"matcher": "", "hooks": [{"type": "command", "command": "/x/orca-hook.sh"}]}
+        theirs = self.ours("HERDR_PLUGIN_STATE_DIR=/other python3 /x/grazr.py failure")
+        self.write({"hooks": {"StopFailure": [orca, theirs]}})
+
+        with self.assertRaises(RuntimeError) as caught:
+            claude.install_failure_hook(self.config_dir, self.COMMAND)
+
+        self.assertIn("another grazr", str(caught.exception))
+        self.assertIn("/other", str(caught.exception))
+        self.assertEqual(self.read()["hooks"]["StopFailure"], [orca, theirs])
+
+    def test_a_hand_written_grazr_failure_command_counts_as_another_grazr(self):
+        theirs = self.ours("cd /x && python3 grazr.py failure")
+        self.write({"hooks": {"StopFailure": [theirs]}})
+
+        with self.assertRaises(RuntimeError):
+            claude.install_failure_hook(self.config_dir, self.COMMAND)
+
+    def test_force_replaces_the_other_grazr_group_and_keeps_orcas(self):
+        orca = {"matcher": "", "hooks": [{"type": "command", "command": "/x/orca-hook.sh"}]}
+        theirs = self.ours("HERDR_PLUGIN_STATE_DIR=/other python3 /x/grazr.py failure")
+        self.write({"hooks": {"StopFailure": [orca, theirs]}})
+
+        self.assertEqual(claude.install_failure_hook(self.config_dir, self.COMMAND, force=True),
+                         "Failure hook connected")
+
+        self.assertEqual(self.read()["hooks"]["StopFailure"], [orca, self.ours()])
+
+    def test_it_is_installed_when_the_state_dir_matches_whatever_the_path(self):
+        claude.install_failure_hook(self.config_dir, self.COMMAND)
+
+        self.assertTrue(claude.failure_hook_installed(
+            self.config_dir, "HERDR_PLUGIN_STATE_DIR=/s python3 /elsewhere/grazr.py failure"))
+        self.assertFalse(claude.failure_hook_installed(
+            self.config_dir, "HERDR_PLUGIN_STATE_DIR=/other python3 /p/grazr.py failure"))
+
+    def test_uninstall_keeps_another_grazrs_group(self):
+        theirs = self.ours("HERDR_PLUGIN_STATE_DIR=/other python3 /x/grazr.py failure")
+        self.write({"hooks": {"StopFailure": [theirs, self.ours()]}})
+
+        claude.uninstall_failure_hook(self.config_dir, self.COMMAND)
+
+        self.assertEqual(self.read()["hooks"]["StopFailure"], [theirs])
 
     def test_the_connect_action_installs_both(self):
         state_dir = tempfile.mkdtemp()
