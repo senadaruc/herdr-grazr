@@ -204,7 +204,9 @@ def _notify_queue(title, body, spawn):
     path = os.path.join(state_dir, NOTICES_QUEUE)
     line = json.dumps({"ts": _now_ts(), "title": title, "body": body}) + "\n"
     try:
-        with _file_lock(os.path.join(state_dir, NOTICES_QUEUE_LOCK), wait=True):
+        with _file_lock(os.path.join(state_dir, NOTICES_QUEUE_LOCK), wait=True) as held:
+            if not held:
+                return False
             with open(path, "a") as handle:
                 handle.write(line)
             with open(path) as handle:
@@ -673,6 +675,13 @@ def _config_path():
         or os.path.expanduser("~/.grazr")
     )
     return os.path.join(directory, "config.env")
+
+
+# Said by the refusal and by `status`, so the two cannot drift apart.
+MANAGED_NOTICE = (
+    "runs an Orca-managed Claude account (%s); "
+    "grazr only rotates the System default login"
+)
 
 
 def managed_claude_home():
@@ -1599,15 +1608,23 @@ def notices_drain(runtime=None):
     """
     state_dir = runtime.state_dir if runtime else _state_dir()
     path = os.path.join(state_dir, NOTICES_QUEUE)
-    with _file_lock(os.path.join(state_dir, NOTICES_QUEUE_LOCK), wait=True):
-        try:
-            with open(path) as handle:
-                queued = handle.read()
-        except OSError:
-            return 0
-        if queued:
-            sys.stdout.write(queued)
-            atomic.write(path, "")
+    try:
+        with _file_lock(os.path.join(state_dir, NOTICES_QUEUE_LOCK), wait=True) as held:
+            if not held:
+                return 0
+            try:
+                with open(path) as handle:
+                    queued = handle.read()
+            except OSError:
+                return 0
+            if queued:
+                sys.stdout.write(queued)
+                # A broken pipe surfaces here, before the truncate, so the notices stay queued.
+                sys.stdout.flush()
+                atomic.write(path, "")
+    except OSError as error:
+        print("grazr: notices: %s" % error, file=sys.stderr)
+        return 1
     return 0
 
 
@@ -1762,7 +1779,7 @@ def swap(runtime=None, target=None):
 
 
 def _refuse_managed(home):
-    print("grazr: this terminal runs an Orca-managed Claude account (%s); grazr only rotates the System default login" % home)
+    print("grazr: this terminal %s" % (MANAGED_NOTICE % home))
     return 1
 
 
@@ -1876,7 +1893,7 @@ def status(runtime=None, as_json=False, wait=True):
              "   DRY_RUN" if config.dry_run else ""))
     home = managed_claude_home()
     if home:
-        print("  This terminal runs an Orca-managed Claude account (%s); grazr only rotates the System default login\n" % home)
+        print("  This terminal %s\n" % (MANAGED_NOTICE % home))
 
     enrolled = accounts.load(paths, config.accounts)
     blocked = _read_blocked(state_dir, datetime.now(timezone.utc))

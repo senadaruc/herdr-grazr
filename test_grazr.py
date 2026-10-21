@@ -2165,6 +2165,8 @@ class NotifyTest(unittest.TestCase):
             return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
 
         with mock.patch.dict(os.environ, {"HERDR_BIN_PATH": herdr}):
+            # A leaked GRAZR_NOTIFIER would turn this herdr-only check into a different one.
+            os.environ.pop("GRAZR_NOTIFIER", None)
             shown = grazr.notify("t", "b", spawn=fake_subprocess)
         return shown, recorded.get("argv")
 
@@ -2335,6 +2337,64 @@ class NotifierBackendTest(unittest.TestCase):
         path, wait = entered[0]
         self.assertTrue(path.endswith("notices.queue.lock"), path)
         self.assertTrue(wait)
+
+    def test_a_queue_lock_that_is_not_held_takes_no_notice(self):
+        @contextlib.contextmanager
+        def unheld(path, wait=False):
+            yield False
+
+        with self.environment({"GRAZR_NOTIFIER": "queue"}), mock.patch.object(
+            grazr, "_file_lock", unheld
+        ):
+            shown = grazr.notify("t", "b", spawn=self.no_spawn)
+
+        self.assertFalse(shown)
+        self.assertEqual(self.queued(), "")
+
+    def test_drain_that_does_not_hold_the_lock_prints_nothing_and_keeps_the_queue(self):
+        with self.environment({"GRAZR_NOTIFIER": "queue"}):
+            grazr.notify("one", "b", spawn=self.no_spawn)
+        queued = self.queued()
+
+        @contextlib.contextmanager
+        def unheld(path, wait=False):
+            yield False
+
+        out = io.StringIO()
+        with self.environment({}), mock.patch.object(grazr, "_file_lock", unheld), \
+                contextlib.redirect_stdout(out):
+            status = grazr.notices_drain()
+
+        self.assertEqual((status, out.getvalue(), self.queued()), (0, "", queued))
+
+    def test_a_stdout_that_breaks_keeps_the_queue(self):
+        with self.environment({"GRAZR_NOTIFIER": "queue"}):
+            grazr.notify("one", "b", spawn=self.no_spawn)
+        queued = self.queued()
+
+        class BrokenPipe(io.StringIO):
+            def flush(self):
+                raise BrokenPipeError(32, "Broken pipe")
+
+        err = io.StringIO()
+        with self.environment({}), contextlib.redirect_stdout(BrokenPipe()), \
+                contextlib.redirect_stderr(err):
+            status = grazr.notices_drain()
+
+        self.assertEqual(status, 1)
+        self.assertEqual(self.queued(), queued)
+        self.assertIn("grazr: notices:", err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
+
+    def test_a_missing_state_dir_is_reported_without_a_traceback(self):
+        missing = os.path.join(self.state_dir, "gone")
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {"GRAZR_STATE_DIR": missing}, clear=True), \
+                contextlib.redirect_stderr(err):
+            status = grazr.notices_drain()
+
+        self.assertEqual(status, 1)
+        self.assertIn("grazr: notices:", err.getvalue())
 
     def test_osascript_passes_the_text_as_argv_never_as_script(self):
         recorded = {}
