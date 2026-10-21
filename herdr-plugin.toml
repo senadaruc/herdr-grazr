@@ -24,6 +24,13 @@ contexts = ["global", "workspace"]
 command = ["python3", "grazr.py", "install"]
 
 [[actions]]
+id = "install-force"
+title = "grazr: connect, taking over from another grazr"
+description = "Take Claude's status line and failure hook over from another grazr install (Herdr's or Orca's), keeping the bar it had displaced"
+contexts = ["global"]
+command = ["python3", "grazr.py", "install", "--force"]
+
+[[actions]]
 id = "uninstall"
 title = "grazr: disconnect from Claude's status line"
 description = "Put the status line back the way it was and remove the StopFailure hook; grazr then sees no usage"

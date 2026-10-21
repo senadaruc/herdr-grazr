@@ -587,10 +587,14 @@ def uninstall_statusline(config_dir, record_path):
     return "Status line disconnected"
 
 
-def statusline_installed(config_dir, record_path):
+def statusline_installed(config_dir, record_path, state_dir=None):
     """grazr's shim is in, or the user's own bar runs grazr: either way
     every message reaches it. Another grazr's shim, or a bar that runs only
-    another grazr, does not count."""
+    another grazr, does not count.
+
+    With no record, a bar counts only when it runs state_dir, the one grazr
+    is installed with, since nothing else says whose bar it is. Without
+    state_dir a bar counts as it always has."""
     try:
         current = _read_settings(config_dir).get("statusLine")
     except RuntimeError:
@@ -600,9 +604,9 @@ def statusline_installed(config_dir, record_path):
         return recorded is not None and same_owner(current, recorded["shim"])
     if runs_grazr(current):
         if recorded is None:
-            return True
+            return state_dir is None or _normal_dir(state_dir) in _named_state_dirs(current)
         embedded = _embedded_state_dirs(current)
-        return not embedded or carried_state_dir(recorded["shim"]) in embedded
+        return not embedded or _normal_dir(carried_state_dir(recorded["shim"])) in _named_state_dirs(current)
     return False
 
 
@@ -650,31 +654,65 @@ def carried_state_dir(command):
 
 
 def same_owner(a, b):
-    """Both are grazr shims, and they carry the same state dir once paths are
-    normalised, so "/s/" and "/s" are one owner."""
+    """Both are grazr shims, and they carry the same state dir once spelled
+    the same way, so "/s/", "$HOME/s" and "~/s" are one owner as "/s" is."""
     if not (is_shim(a) and is_shim(b)):
         return False
     return _normal_dir(carried_state_dir(a)) == _normal_dir(carried_state_dir(b))
 
 
 def _normal_dir(state_dir):
-    return os.path.normpath(state_dir) if state_dir else state_dir
+    """One spelling of a state dir for comparisons: $VAR and ~ expanded,
+    trailing slashes and ./ dropped. The empty string is the default ~/.grazr,
+    which is where a shim that carries no state dir runs."""
+    return os.path.normpath(os.path.expanduser(os.path.expandvars(state_dir or "~/.grazr")))
+
+
+def _named_state_dirs(entry):
+    """Every state dir a bar names, spelled by _normal_dir, with the default
+    when it names none."""
+    return [_normal_dir(value) for value in _embedded_state_dirs(entry)] or [_normal_dir("")]
 
 
 def _is_ours(entry, shim):
     return same_owner(entry, shim)
 
 
-def foreign_statusline(config_dir, shim):
-    """The state dir of another grazr whose shim holds Claude's status line, or
-    None. A shim that carries no state dir is reported as ~/.grazr."""
+def _current_statusline(config_dir):
+    """Claude's status line, or None when settings.json cannot be read. Reads
+    that fail are reported where they are touched, not here."""
     try:
-        current = _read_settings(config_dir).get("statusLine")
+        return _read_settings(config_dir).get("statusLine")
     except RuntimeError:
-        # Unreadable settings are reported where they are touched, not here.
         return None
-    if is_shim(current) and not same_owner(current, shim):
-        return _state_label(carried_state_dir(current))
+
+
+def foreign_statusline(config_dir, shim):
+    """The state dir of another grazr that holds Claude's status line, or None.
+    That is another grazr's shim, or a bar of the user's that calls one. A shim
+    that carries no state dir, or a bar that names none, is reported as ~/.grazr."""
+    current = _current_statusline(config_dir)
+    if is_shim(current):
+        return None if same_owner(current, shim) else _state_label(carried_state_dir(current))
+    return _foreign_in_bar(current, shim)
+
+
+def foreign_bar(config_dir, shim):
+    """The state dir of another grazr that the user's own status line calls, or
+    None. install refuses that whatever force says: taking the hook while the
+    bar stays would leave two grazrs answering the same messages."""
+    return _foreign_in_bar(_current_statusline(config_dir), shim)
+
+
+def _foreign_in_bar(entry, shim):
+    """The first state dir a user's bar names that is not shim's, or None when
+    the bar is not one that runs grazr, is a shim, or names only shim's dir."""
+    if is_shim(entry) or not runs_grazr(entry):
+        return None
+    ours = _normal_dir(carried_state_dir(shim))
+    for state_dir in _embedded_state_dirs(entry) or [""]:
+        if _normal_dir(state_dir) != ours:
+            return _state_label(state_dir)
     return None
 
 

@@ -60,9 +60,15 @@ _THRESHOLD_KEYS = {"REMAINING_SESSION": ("session", 15), "REMAINING_WEEKLY": ("w
 _FLAG_KEYS = (("ENABLED", True), ("DRY_RUN", False), ("MODEL_LIMITS", False))
 
 LOG = "grazr.log"
-# Shared by install and enrol, so the wording that refuses a takeover lives once.
+# Shared by install, enrol and status, so the wording that refuses a takeover lives once.
+# Under Herdr the forced connect is an action, since a Herdr action takes no flag.
+TAKEOVER_HINT = ("disconnect it there, or take it over with install --force "
+                 "(under Herdr: the \"connect, taking over\" action)")
 FOREIGN_OWNER_REFUSAL = ("Claude's status line or StopFailure hook already belongs to another grazr "
-                         "(state in %s); disconnect it there, or run install --force to take it over")
+                         "(state in %s); " + TAKEOVER_HINT)
+# A bar of the user's that runs another grazr is never taken over, forced or not.
+FOREIGN_BAR_REFUSAL = ("Claude's status line is your own bar running another grazr (state in %s); "
+                       "edit the bar by hand, --force leaves it alone")
 PREVIOUS_STATUSLINE = claude.PREVIOUS_STATUSLINE
 UNREADABLE_PENDING = "statusline.unreadable.json"
 # Only a live session can miss twice, so the armed set never needs to be large.
@@ -146,18 +152,31 @@ def notify(title, body, spawn=subprocess.run):
     whether one of them showed it, which is what `_announce_once` retries on.
 
     Unset or empty means Herdr's toast alone, which is what grazr always did.
+    A list of only `none`, or of `none` and unknown names, is a deliberate
+    silence, so it counts as shown rather than being retried forever.
     """
     shown = False
     for backend in _notifiers():
         shown = _NOTIFIERS[backend](title, body, spawn) or shown
-    return shown
+    return shown or _deliberately_silent()
 
 
 def _notifiers():
-    """The backends GRAZR_NOTIFIER names, in order. Unknown names are dropped
-    and `none` is one of them, so a typo silences that backend, never the hook."""
+    """The backends GRAZR_NOTIFIER names, in order. Unknown names are dropped,
+    and so is `none`, which is no backend at all, so a typo silences that
+    backend, never the hook."""
+    return [name for name in _configured_names() if name in _NOTIFIERS]
+
+
+def _configured_names():
     names = (os.environ.get("GRAZR_NOTIFIER") or "herdr").split(",")
-    return [name for name in (name.strip() for name in names) if name in _NOTIFIERS]
+    return [name.strip() for name in names]
+
+
+def _deliberately_silent():
+    """Whether GRAZR_NOTIFIER names `none` and no backend that exists."""
+    names = _configured_names()
+    return "none" in names and not any(name in _NOTIFIERS for name in names)
 
 
 def _notify_herdr(title, body, spawn):
@@ -1652,7 +1671,7 @@ def tag(runtime=None):
     else:
         pins.prune(state_dir, _live_panes())
         tag_all(named, pinned=pinned)
-    if not claude.statusline_installed(paths.config_dir, _record_path(state_dir)):
+    if not claude.statusline_installed(paths.config_dir, _record_path(state_dir), state_dir):
         line = "The status line is not grazr's, so grazr sees no usage. Run the connect action"
         if _announce_once(state_dir, "statusline-missing", "grazr: status line not connected", line):
             print(line)
@@ -1663,6 +1682,11 @@ def install(runtime=None, force=False):
     paths, _, state_dir, _ = runtime or _runtime()
     shim = _shim_command(state_dir)
     hook = _failure_command(state_dir)
+    # Checked before either slot is written, and never forced: the bar stays, so the hook must not move.
+    bar = claude.foreign_bar(paths.config_dir, shim)
+    if bar:
+        print("grazr: %s" % (FOREIGN_BAR_REFUSAL % bar))
+        return 1
     other = claude.foreign_owner(paths.config_dir, shim, hook)
     if other and not force:
         print("grazr: %s" % (FOREIGN_OWNER_REFUSAL % other))
@@ -1802,7 +1826,7 @@ def status_report(runtime, now=None):
     enrolled_ids = {entry.id for entry in everyone}
     ordered_ids = {entry.id for entry in accounts.load(paths, config.accounts)}
     blocked = _read_blocked(state_dir, now)
-    statusline = claude.statusline_installed(paths.config_dir, _record_path(state_dir))
+    statusline = claude.statusline_installed(paths.config_dir, _record_path(state_dir), state_dir)
     failure_hook = claude.failure_hook_installed(paths.config_dir, _failure_command(state_dir))
     last = _last_rotation(state_dir)
     return {
@@ -1909,16 +1933,18 @@ def status(runtime=None, as_json=False, wait=True):
             print("  %-16s not enrolled, so it is never used" % name)
 
     print("\nactive account headroom: %s" % _describe(_latest_reading(paths, active)))
-    if not claude.statusline_installed(paths.config_dir, _record_path(state_dir)):
+    if not claude.statusline_installed(paths.config_dir, _record_path(state_dir), state_dir):
         other = claude.foreign_statusline(paths.config_dir, _shim_command(state_dir))
-        if other:
-            print("  The status line belongs to another grazr (state in %s). Run install --force to take it over" % other)
+        if other and claude.foreign_bar(paths.config_dir, _shim_command(state_dir)):
+            print("  The status line is your own bar, and it runs another grazr (state in %s). Edit the bar by hand" % other)
+        elif other:
+            print("  The status line belongs to another grazr (state in %s); %s" % (other, TAKEOVER_HINT))
         else:
             print("  The status line is not grazr's, so grazr sees no usage. Run the connect action")
     if not claude.failure_hook_installed(paths.config_dir, _failure_command(state_dir)):
         other = claude.foreign_failure_hook(paths.config_dir, _failure_command(state_dir))
         if other:
-            print("  The failure hook belongs to another grazr (state in %s). Run install --force to take it over" % other)
+            print("  The failure hook belongs to another grazr (state in %s); %s" % (other, TAKEOVER_HINT))
         else:
             print("  The failure hook is not connected, so an account the server refuses stays put. Run the connect action")
     if active and not any(account.id == active for account in enrolled):
@@ -2042,6 +2068,11 @@ def _enrol_from(runtime, source):
     # Checked before either slot is written, so a split between two grazrs never happens.
     shim = _shim_command(state_dir)
     hook = _failure_command(state_dir)
+    bar = claude.foreign_bar(paths.config_dir, shim)
+    if bar:
+        # Enrolling worked. The bar runs another grazr, and that bar is the user's to edit.
+        print("grazr: %s" % (FOREIGN_BAR_REFUSAL % bar))
+        return 0
     other = claude.foreign_owner(paths.config_dir, shim, hook)
     if other:
         # Enrolling worked. The status line or hook is another grazr's to keep.

@@ -25,6 +25,12 @@ import stores
 from core import Account, Limit, decide, merged, next_account
 
 
+def _read_text(path):
+    """The whole text of a file, closed at once so no test run warns about it."""
+    with open(path) as handle:
+        return handle.read()
+
+
 def setUpModule():
     # The local OSC 777 forwarder is real on cloud-dev, and a test run must
     # not toast every client attached there.
@@ -2136,7 +2142,7 @@ class AtomicWriteTest(unittest.TestCase):
 
         with mock.patch.object(
             atomic.os, "replace",
-            lambda source, target: seen.append(open(target).read()) or real_replace(source, target),
+            lambda source, target: seen.append(_read_text(target)) or real_replace(source, target),
         ):
             atomic.write(self.path, "the new contents")
 
@@ -2471,9 +2477,17 @@ class NotifierBackendTest(unittest.TestCase):
 
         self.assertEqual(self.queued(), "")
 
-    def test_none_shows_nothing_even_with_herdr_present(self):
+    def test_none_counts_as_shown_even_with_herdr_present(self):
+        """A deliberate silence is not a failed toast, so it is never retried."""
         with self.environment({"GRAZR_NOTIFIER": "none", "HERDR_BIN_PATH": "/usr/bin/herdr"}):
-            self.assertFalse(grazr.notify("t", "b", spawn=self.no_spawn))
+            self.assertTrue(grazr.notify("t", "b", spawn=self.no_spawn))
+
+        self.assertEqual(self.queued(), "")
+
+    def test_none_with_unknown_names_counts_as_shown(self):
+        for value in ("none,bogus", " none "):
+            with self.subTest(value=value), self.environment({"GRAZR_NOTIFIER": value}):
+                self.assertTrue(grazr.notify("t", "b", spawn=self.no_spawn))
 
         self.assertEqual(self.queued(), "")
 
@@ -3225,6 +3239,27 @@ class StatusJsonTest(EnrolledPairFixture):
         self.assertFalse(report["connection"]["statusline"])
         self.assertFalse(report["installed"])
 
+    def test_a_bar_that_runs_another_grazr_is_named_and_does_not_count_as_installed(self):
+        command = "input=$(cat); g=$(echo \"$input\" | HERDR_PLUGIN_STATE_DIR=/h/s python3 /x/grazr.py statusline); printf '%s' \"$g\""
+        with open(os.path.join(self.claude_dir, "settings.json"), "w") as handle:
+            json.dump({"statusLine": {"type": "command", "command": command}}, handle)
+
+        report = self.report()
+
+        self.assertEqual(report["connection"]["foreign"]["statusline"], "/h/s")
+        self.assertFalse(report["connection"]["statusline"])
+        self.assertFalse(report["installed"])
+
+    def test_a_bar_that_runs_our_state_dir_is_reported_as_ours(self):
+        command = "input=$(cat); g=$(echo \"$input\" | HERDR_PLUGIN_STATE_DIR=%s python3 /x/grazr.py statusline); printf '%%s' \"$g\"" % shlex.quote(self.state_dir)
+        with open(os.path.join(self.claude_dir, "settings.json"), "w") as handle:
+            json.dump({"statusLine": {"type": "command", "command": command}}, handle)
+
+        report = self.report()
+
+        self.assertTrue(report["connection"]["statusline"])
+        self.assertIsNone(report["connection"]["foreign"]["statusline"])
+
     def test_the_notifier_is_the_one_the_environment_names(self):
         self.assertEqual(self.report()["settings"]["notifier"], "herdr")
         self.assertEqual(self.report(GRAZR_NOTIFIER="queue")["settings"]["notifier"], "queue")
@@ -3941,6 +3976,52 @@ class ShimPartsTest(unittest.TestCase):
         ))
         self.assertFalse(claude.same_owner("mine", "mine"))
 
+    def test_spellings_of_one_state_dir_are_the_same_owner(self):
+        """$HOME, ~, a trailing slash and a ./ all name /h/x, so they are one owner."""
+        with mock.patch.dict(os.environ, {"HOME": "/h"}):
+            for spelled in ("$HOME/x", "~/x", "/h/x/", "/h/./x"):
+                with self.subTest(spelled=spelled):
+                    self.assertTrue(claude.same_owner(
+                        "HERDR_PLUGIN_STATE_DIR=%s python3 /a/grazr.py statusline" % spelled,
+                        "HERDR_PLUGIN_STATE_DIR=/h/x python3 /a/grazr.py statusline",
+                    ))
+
+    def test_a_shim_without_a_state_dir_is_the_default_owner(self):
+        with mock.patch.dict(os.environ, {"HOME": "/h"}):
+            self.assertTrue(claude.same_owner(
+                "python3 /a/grazr.py statusline",
+                "HERDR_PLUGIN_STATE_DIR=~/.grazr python3 /a/grazr.py statusline",
+            ))
+            self.assertTrue(claude.same_owner(
+                "python3 /a/grazr.py statusline",
+                "HERDR_PLUGIN_STATE_DIR=/h/.grazr/ python3 /a/grazr.py statusline",
+            ))
+            self.assertFalse(claude.same_owner(
+                "python3 /a/grazr.py statusline",
+                "HERDR_PLUGIN_STATE_DIR=/h/s python3 /a/grazr.py statusline",
+            ))
+
+
+class ManifestTest(unittest.TestCase):
+    """The Herdr actions the plugin offers. The forced connect is the one a
+    Herdr user takes over another grazr's install, since an action takes no flag."""
+
+    def test_the_forced_connect_action_follows_connect(self):
+        with open(os.path.join(os.path.dirname(os.path.abspath(grazr.__file__)), "herdr-plugin.toml")) as handle:
+            manifest = handle.read()
+
+        self.assertIn(
+            '[[actions]]\nid = "install-force"\n'
+            'title = "grazr: connect, taking over from another grazr"\n'
+            'description = "Take Claude\'s status line and failure hook over from another grazr install '
+            '(Herdr\'s or Orca\'s), keeping the bar it had displaced"\n'
+            'contexts = ["global"]\n'
+            'command = ["python3", "grazr.py", "install", "--force"]\n',
+            manifest,
+        )
+        self.assertLess(manifest.index('id = "install"'), manifest.index('id = "install-force"'))
+        self.assertLess(manifest.index('id = "install-force"'), manifest.index('id = "uninstall"'))
+
 
 class ConnectTest(EnrolledPairFixture):
     """Connecting grazr to Claude's status line, from the enrol pane or the
@@ -4026,6 +4107,18 @@ class ConnectTest(EnrolledPairFixture):
         self.assertIn("The status line belongs to another grazr (state in %s)" % other, printed)
         self.assertIn("The failure hook belongs to another grazr (state in %s)" % other, printed)
         self.assertIn("install --force", printed)
+        self.assertIn('the "connect, taking over" action', printed)
+
+    def test_status_names_a_bar_that_runs_another_grazr_as_a_bar(self):
+        other = os.path.join(self.directory, "other")
+        self.write_settings({"statusLine": {"type": "command", "command":
+               "input=$(cat); g=$(echo \"$input\" | HERDR_PLUGIN_STATE_DIR=%s python3 /x/grazr.py statusline); printf '%%s' \"$g\"" % shlex.quote(other)}})
+
+        _, printed = self.invoke(grazr.status)
+
+        self.assertIn("The status line is your own bar, and it runs another grazr (state in %s)" % other, printed)
+        self.assertNotIn("The status line belongs to another grazr", printed)
+        self.assertNotIn("install --force", printed)
 
     def test_enrolling_next_to_another_grazr_enrols_and_leaves_its_slots(self):
         other = os.path.join(self.directory, "other")
@@ -4180,17 +4273,80 @@ class ConnectTest(EnrolledPairFixture):
 
         self.assertIsNone(self.record()["previous"])
 
-    def test_a_bar_that_embeds_another_grazr_is_left_alone_even_with_force(self):
-        bar = {"type": "command", "command":
-               "input=$(cat); g=$(echo \"$input\" | HERDR_PLUGIN_STATE_DIR=/other python3 /x/grazr.py statusline); printf '%s' \"$g\""}
+    def test_a_bar_that_embeds_another_grazr_is_refused_even_with_force(self):
+        """A bar of the user's that calls another grazr is not ours to rewrite.
+        Taking the hook while it stays would split Claude's ownership: one grazr
+        rotates from the bar while the other answers every refusal."""
+        other = os.path.join(self.directory, "other")
+        settings = self.another_grazr(other)
+        settings["statusLine"] = {"type": "command", "command":
+               "input=$(cat); g=$(echo \"$input\" | HERDR_PLUGIN_STATE_DIR=%s python3 /x/grazr.py statusline); printf '%%s' \"$g\"" % shlex.quote(other)}
+        self.write_settings(settings)
+        before = self.raw_settings()
         for force in (False, True):
             with self.subTest(force=force):
-                self.write_settings({"statusLine": bar})
+                code, printed = self.invoke(lambda runtime: grazr.install(runtime, force=force))
 
-                _, printed = self.invoke(lambda runtime: grazr.install(runtime, force=force))
+                self.assertEqual(code, 1)
+                self.assertIn("status line is your own bar running another grazr (state in %s)" % other, printed)
+                self.assertIn("edit the bar by hand", printed)
+                self.assertEqual(self.raw_settings(), before)
+                self.assertFalse(os.path.exists(grazr._record_path(self.state_dir)))
 
-                self.assertEqual(self.settings()["statusLine"], bar)
-                self.assertIn("left alone", printed)
+    def test_a_bar_that_names_no_state_dir_is_the_default_grazr(self):
+        self.write_settings({"statusLine": {"type": "command", "command":
+               "input=$(cat); g=$(echo \"$input\" | python3 /x/grazr.py statusline); printf '%s' \"$g\""}})
+        before = self.raw_settings()
+
+        code, printed = self.invoke(grazr.install)
+
+        self.assertEqual(code, 1)
+        self.assertIn("(state in ~/.grazr)", printed)
+        self.assertEqual(self.raw_settings(), before)
+
+    def test_a_bar_that_embeds_our_state_dir_is_ours(self):
+        bar = {"type": "command", "command":
+               "input=$(cat); g=$(echo \"$input\" | HERDR_PLUGIN_STATE_DIR=%s/ python3 /x/grazr.py statusline); printf '%%s' \"$g\"" % shlex.quote(self.state_dir)}
+        self.write_settings({"statusLine": bar})
+
+        code, _ = self.invoke(grazr.install)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(self.settings()["statusLine"], bar)
+        self.assertTrue(claude.statusline_installed(self.claude_dir, grazr._record_path(self.state_dir), self.state_dir))
+
+    def test_a_bar_naming_our_dir_with_a_trailing_slash_is_ours_once_recorded(self):
+        self.invoke(grazr.install)
+        self.write_settings({"statusLine": {"type": "command", "command":
+               "input=$(cat); g=$(echo \"$input\" | HERDR_PLUGIN_STATE_DIR=%s/ python3 /x/grazr.py statusline); printf '%%s' \"$g\"" % shlex.quote(self.state_dir)}})
+
+        self.assertTrue(claude.statusline_installed(self.claude_dir, grazr._record_path(self.state_dir)))
+
+    def test_a_bar_without_a_record_counts_only_when_it_runs_our_state_dir(self):
+        record = grazr._record_path(self.state_dir)
+        bar = "input=$(cat); g=$(echo \"$input\" | %s python3 /x/grazr.py statusline); printf '%%s' \"$g\""
+
+        def installed_with(prefix, state_dir=self.state_dir):
+            self.write_settings({"statusLine": {"type": "command", "command": bar % prefix}})
+            return claude.statusline_installed(self.claude_dir, record, state_dir)
+
+        self.assertTrue(installed_with("HERDR_PLUGIN_STATE_DIR=" + shlex.quote(self.state_dir) + "/"))
+        self.assertFalse(installed_with("HERDR_PLUGIN_STATE_DIR=/other"))
+        self.assertFalse(installed_with(""))
+        self.assertTrue(installed_with("", state_dir=os.path.expanduser("~/.grazr")))
+        self.assertTrue(installed_with("HERDR_PLUGIN_STATE_DIR=/other", state_dir=None))
+
+    def test_foreign_bar_is_the_state_dir_the_bar_runs(self):
+        """Only a bar of the user's that runs another grazr counts; a shim of
+        another grazr is a foreign slot, not a foreign bar."""
+        other = os.path.join(self.directory, "other")
+        self.write_settings(self.another_grazr(other))
+        self.assertIsNone(claude.foreign_bar(self.claude_dir, grazr._shim_command(self.state_dir)))
+        bar = {"type": "command", "command": "input=$(cat); g=$(echo \"$input\" | HERDR_PLUGIN_STATE_DIR=%s python3 /x/grazr.py statusline); printf '%%s' \"$g\"" % shlex.quote(other)}
+        self.write_settings({"statusLine": bar})
+
+        self.assertEqual(claude.foreign_bar(self.claude_dir, grazr._shim_command(self.state_dir)), other)
+        self.assertEqual(claude.foreign_statusline(self.claude_dir, grazr._shim_command(self.state_dir)), other)
 
     def test_uninstall_leaves_another_grazrs_slots_and_our_record_alone(self):
         self.invoke(grazr.install)
