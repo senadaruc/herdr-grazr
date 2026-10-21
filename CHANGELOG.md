@@ -4,6 +4,35 @@ Notable changes to *grazr*, newest first. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.4.7+senad.6 - 2026-10-21
+
+### Added
+
+- `GRAZR_STATE_DIR` and `GRAZR_CONFIG_DIR` name the state and config
+  directories for a host that is not Herdr; they take precedence over the
+  `HERDR_PLUGIN_*` pair, and the shim carries whichever pair is in use.
+- `GRAZR_NOTIFIER` chooses how grazr speaks up: `herdr` (default), `queue`
+  (a `notices.jsonl` file another client drains), `osascript` (a macOS
+  notification), `none`, or a comma-separated list. `grazr.py notices-drain`
+  prints and empties the queue.
+- `grazr.py status --json` reports everything the status pane shows as one
+  JSON object and never waits for a key; `status --no-wait` for the text.
+- `grazr.py install --force` takes the status line and failure hook over
+  from another grazr install, keeping that install's previous bar.
+- `grazr.py set ENABLED 0|1`.
+
+### Changed
+
+- Inside an Orca-managed Claude account (`CLAUDE_CONFIG_DIR` under
+  `claude-profiles/`, or `ORCA_CLAUDE_INJECTED_CONFIG_DIR`) grazr only runs
+  the previous status bar: it reads nothing, rotates nothing, and `swap`,
+  `enrol` and `refresh` refuse. Orca copies the hooks into every profile, and
+  rotating a profile's credential would corrupt Orca's own accounts.
+- The status line and the StopFailure hook belong to the grazr whose state
+  directory they carry. Connecting refuses a slot owned by another grazr
+  instead of taking it silently, and disconnecting leaves it alone.
+- Without a Herdr binary the pane tags and pane list are skipped outright.
+
 ## 0.4.7+senad.5 - 2026-10-19
 
 ### Fixed

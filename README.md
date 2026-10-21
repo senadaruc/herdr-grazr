@@ -296,6 +296,50 @@ until you enrol it again, swaps nothing and says so. If the account you name is 
 on again, unless `ENABLED=0`. Herdr actions take no arguments, so this one is
 for scripts and for clients that let you pick the account.
 
+## Running under Orca
+
+The same engine runs under [Orca](https://github.com/senadaruc/orca-account-autoswitch),
+driven by the Orca plugin `senadaruc.grazr` instead of Herdr. Orca stays on its
+**System default** account, and *grazr* rotates that login. Orca's own managed
+accounts are never touched. The guard below says how.
+
+Outside Herdr, `GRAZR_STATE_DIR` and `GRAZR_CONFIG_DIR` name the state and
+config directories. They take precedence over `HERDR_PLUGIN_STATE_DIR` and
+`HERDR_PLUGIN_CONFIG_DIR`. The Orca plugin uses `~/.local/state/orca-grazr` and
+`~/.config/orca-grazr`. The status line and failure hook written into
+`~/.claude/settings.json` carry whichever pair is in use, so the hooks run
+against the same directories.
+
+`GRAZR_NOTIFIER` chooses how *grazr* speaks up: `herdr` (the default), `queue`,
+`osascript`, `none`, or a comma-separated list such as `queue,osascript`. The
+`queue` backend appends each notice to `notices.jsonl` in the state directory.
+`grazr.py notices-drain` prints the queue and empties it, and the Orca plugin
+runs that every two minutes. On a Mac use `queue,osascript`. On a Linux box use
+`queue`.
+
+In a Claude pane whose `CLAUDE_CONFIG_DIR` is one of Orca's `claude-profiles/`
+directories, or where `ORCA_CLAUDE_INJECTED_CONFIG_DIR` is set, *grazr* only
+runs the previous status bar. It reads nothing and rotates nothing. `swap`,
+`enrol` and `refresh` refuse, and `status` says why.
+
+The status line and the failure hook belong to the *grazr* whose state
+directory they carry. `install` refuses a slot that another *grazr* owns.
+`install --force` takes it over and keeps the bar that *grazr* had displaced. A
+bar of your own that calls *grazr* is always left alone.
+
+On a Mac that already runs Herdr's *grazr*, install in this order:
+
+1. In Herdr, run the action `grazr: disconnect from Claude's status line`.
+2. Restart Orca, or open a Claude pane, so Orca installs its own status line.
+3. Run `Grazr: Install engine on target` in Orca. The engine chains Orca's bar as its previous bar.
+
+The reverse order leaves Orca without its status line.
+
+For scripts, `grazr.py status --json` prints everything the status pane shows as
+one JSON object, and it never waits for a key. `grazr.py status --no-wait`
+prints the same text without waiting. `grazr.py set ENABLED 0` or
+`grazr.py set ENABLED 1` changes the `ENABLED` setting.
+
 ## Pin an agent to an account
 
 Every Claude pane shares the one login *grazr* rotates. To give one agent a
