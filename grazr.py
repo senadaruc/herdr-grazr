@@ -1927,8 +1927,12 @@ def _enrol_from(runtime, source):
         # Enrolling worked. The status line or hook is another grazr's to keep.
         print("grazr: %s" % (FOREIGN_OWNER_REFUSAL % other))
         return 0
-    print(claude.install_statusline(paths.config_dir, _record_path(state_dir), shim))
-    print(claude.install_failure_hook(paths.config_dir, hook))
+    try:
+        print(claude.install_statusline(paths.config_dir, _record_path(state_dir), shim))
+        print(claude.install_failure_hook(paths.config_dir, hook))
+    except RuntimeError as error:
+        # Enrolling worked. Settings that cannot be read are reported, not raised.
+        print("grazr: %s" % error)
     return 0
 
 

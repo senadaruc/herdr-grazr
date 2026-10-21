@@ -3847,6 +3847,30 @@ class ConnectTest(EnrolledPairFixture):
         self.write_settings({"statusLine": {"type": "command", "command": other}})
         self.assertFalse(claude.statusline_installed(self.claude_dir, grazr._record_path(state)))
 
+    def enrol_printing(self):
+        with mock.patch.object(claude, "enrol", lambda *arguments: "uuid-x"), \
+             mock.patch("builtins.input", lambda prompt: "x"):
+            return self.invoke(lambda runtime: grazr._enrol_from(runtime, None))
+
+    def test_enrolling_over_settings_that_are_not_json_reports_it_and_succeeds(self):
+        with open(os.path.join(self.claude_dir, "settings.json"), "w") as handle:
+            handle.write("{not json")
+
+        code, printed = self.enrol_printing()
+
+        self.assertEqual(code, 0)
+        self.assertIn("Enrolled x as uuid-x", printed)
+        self.assertTrue(any(line.startswith("grazr: ") and "not valid JSON" in line for line in printed.splitlines()), printed)
+
+    def test_enrolling_over_a_hooks_value_that_is_not_an_object_reports_it_and_succeeds(self):
+        self.write_settings({"hooks": []})
+
+        code, printed = self.enrol_printing()
+
+        self.assertEqual(code, 0)
+        self.assertIn("Enrolled x as uuid-x", printed)
+        self.assertTrue(any(line.startswith("grazr: ") and "hooks" in line for line in printed.splitlines()), printed)
+
     def write_settings(self, settings):
         with open(os.path.join(self.claude_dir, "settings.json"), "w") as handle:
             json.dump(settings, handle)
