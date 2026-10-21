@@ -3035,6 +3035,179 @@ class SwapTest(EnrolledPairFixture):
         self.assertEqual(swap.call_args_list, [mock.call(target="personal"), mock.call()])
 
 
+class StatusJsonTest(EnrolledPairFixture):
+    """`status --json` is the report the Orca plugin reads over a pipe, and
+    `--no-wait` is the same screen without the key press that holds it open.
+    Neither may ever wait on a key."""
+
+    def report(self, **environment):
+        code, printed = self.invoke(lambda runtime: grazr.status(runtime, as_json=True), **environment)
+        self.assertEqual(code, 0)
+        return json.loads(printed)
+
+    def test_the_report_has_every_key_the_plugin_reads(self):
+        report = self.report()
+
+        self.assertEqual(set(report), {
+            "installed", "connection", "active", "accounts", "order", "settings",
+            "blocked", "changed_at", "last_rotation", "last_reported", "managed_profile", "version",
+        })
+        self.assertEqual(set(report["connection"]), {"statusline", "failure_hook", "foreign"})
+        self.assertEqual(set(report["connection"]["foreign"]), {"statusline", "failure_hook"})
+        self.assertEqual(set(report["settings"]), {
+            "thresholds", "enabled", "dry_run", "model_limits", "parked_poll_minutes",
+            "pinned_rotation", "config_path", "state_dir", "notifier",
+        })
+        self.assertEqual(report["settings"]["thresholds"], {"session": 15, "weekly": 10})
+        self.assertEqual(report["settings"]["state_dir"], self.state_dir)
+        self.assertEqual(report["order"], ["work", "personal"])
+        self.assertEqual(report["version"], grazr.VERSION)
+        self.assertIsNone(report["managed_profile"])
+        self.assertFalse(report["installed"])
+
+    def test_accounts_are_every_enrolled_one_sorted_by_name(self):
+        report = self.report()
+
+        self.assertEqual([entry["name"] for entry in report["accounts"]], ["personal", "work"])
+        self.assertEqual(set(report["accounts"][0]), {
+            "id", "name", "email", "parked", "snapshot", "blocked", "in_order", "first_reading_due",
+        })
+        self.assertEqual(report["accounts"][0]["id"], "uuid-personal")
+        self.assertIsNone(report["accounts"][0]["snapshot"])
+        self.assertTrue(all(entry["in_order"] for entry in report["accounts"]))
+
+    def test_the_active_login_is_named_and_in_order(self):
+        self.assertEqual(
+            self.report()["active"],
+            {"id": "uuid-work", "name": "work", "enrolled": True, "in_order": True},
+        )
+
+    def test_an_active_login_that_is_not_enrolled_is_named_by_its_id(self):
+        os.unlink(os.path.join(self.state_dir, "accounts", "uuid-work.json"))
+
+        self.assertEqual(
+            self.report()["active"],
+            {"id": "uuid-work", "name": "uuid-work", "enrolled": False, "in_order": False},
+        )
+
+    def test_no_login_means_no_active_account(self):
+        with open(os.path.join(self.claude_dir, ".claude.json"), "w") as handle:
+            json.dump({}, handle)
+
+        self.assertIsNone(self.report()["active"])
+
+    def test_an_enrolled_account_left_out_of_accounts_is_not_in_order(self):
+        self.write_config('ACCOUNTS="work"\n')
+
+        report = self.report()
+        by_name = {entry["name"]: entry for entry in report["accounts"]}
+
+        self.assertFalse(by_name["personal"]["in_order"])
+        self.assertTrue(by_name["work"]["in_order"])
+        self.assertEqual(report["order"], ["work"])
+
+    def test_each_account_carries_its_email_reading_block_and_first_reading_flag(self):
+        path = os.path.join(self.state_dir, "accounts", "uuid-personal.json")
+        with open(path) as handle:
+            stored = json.load(handle)
+        stored["oauthAccount"]["emailAddress"] = "personal@example.test"
+        with open(path, "w") as handle:
+            json.dump(stored, handle)
+        self.write_account_snapshot("uuid-personal", 5)
+        accounts.mark_first_reading_due(self.runtime().paths, "uuid-personal")
+        grazr._block(self.state_dir, "uuid-work", "billing_error", None, datetime.now(timezone.utc))
+
+        report = self.report()
+        by_name = {entry["name"]: entry for entry in report["accounts"]}
+
+        self.assertEqual(by_name["personal"]["email"], "personal@example.test")
+        self.assertEqual(by_name["personal"]["snapshot"][0]["remaining"], 5)
+        self.assertEqual(set(by_name["personal"]["snapshot"][0]),
+                         {"kind", "scope", "group", "remaining", "resets_at"})
+        self.assertTrue(by_name["personal"]["first_reading_due"])
+        self.assertIsNone(by_name["personal"]["blocked"])
+        self.assertEqual(by_name["work"]["blocked"], "billing_error")
+        self.assertEqual(set(report["blocked"]), {"uuid-work"})
+        self.assertEqual(set(report["blocked"]["uuid-work"]), {"reason", "at", "until"})
+
+    def test_nothing_has_swapped_yet_reads_as_none(self):
+        report = self.report()
+
+        self.assertIsNone(report["changed_at"])
+        self.assertIsNone(report["last_rotation"])
+
+    def test_changed_at_and_last_rotation_come_from_the_last_swap(self):
+        with open(os.path.join(self.state_dir, grazr.LAST_ROTATION), "w") as handle:
+            json.dump({"to": "uuid-personal", "at": 123.5}, handle)
+
+        report = self.report()
+
+        self.assertEqual(report["changed_at"], 123.5)
+        self.assertEqual(report["last_rotation"], {"to": "uuid-personal", "at": 123.5})
+
+    def test_installed_once_grazr_owns_both_the_status_line_and_the_failure_hook(self):
+        self.invoke(grazr.install)
+
+        report = self.report()
+
+        self.assertTrue(report["installed"])
+        self.assertTrue(report["connection"]["statusline"])
+        self.assertTrue(report["connection"]["failure_hook"])
+        self.assertIsNone(report["connection"]["foreign"]["statusline"])
+
+    def test_a_foreign_status_line_is_named_and_does_not_count_as_installed(self):
+        with open(os.path.join(self.claude_dir, "settings.json"), "w") as handle:
+            json.dump({"statusLine": {"type": "command", "command": grazr._shim_command("/other")}}, handle)
+
+        report = self.report()
+
+        self.assertEqual(report["connection"]["foreign"]["statusline"], "/other")
+        self.assertFalse(report["connection"]["statusline"])
+        self.assertFalse(report["installed"])
+
+    def test_the_notifier_is_the_one_the_environment_names(self):
+        self.assertEqual(self.report()["settings"]["notifier"], "herdr")
+        self.assertEqual(self.report(GRAZR_NOTIFIER="queue")["settings"]["notifier"], "queue")
+
+    def test_neither_the_json_nor_the_no_wait_report_waits_for_a_key(self):
+        with mock.patch.object(grazr, "read_key", self.fail):
+            self.report()
+            code, printed = self.invoke(lambda runtime: grazr.status(runtime, wait=False))
+
+        self.assertEqual(code, 0)
+        self.assertIn("(* = active)", printed)
+        self.assertNotIn("press any key", printed)
+
+    def test_plain_status_still_waits_for_a_key(self):
+        presses = []
+        with mock.patch.object(grazr, "read_key", lambda: presses.append(1) or "q"):
+            code, printed = self.invoke(grazr.status)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(presses, [1])
+        self.assertIn("press any key to close", printed)
+
+    def test_the_command_line_passes_the_flags_in_either_order(self):
+        with mock.patch.object(grazr, "status", return_value=0) as status:
+            for flags in (["--json"], ["--no-wait"], ["--json", "--no-wait"], ["--no-wait", "--json"]):
+                self.assertEqual(grazr._dispatch(["grazr.py", "status"] + flags), 0)
+            self.assertEqual(grazr._dispatch(["grazr.py", "status"]), 0)
+
+        self.assertEqual(status.call_args_list, [
+            mock.call(as_json=True), mock.call(wait=False),
+            mock.call(as_json=True, wait=False), mock.call(as_json=True, wait=False),
+            mock.call(),
+        ])
+
+    def test_a_status_flag_it_does_not_know_prints_usage_and_exits_2(self):
+        with mock.patch.object(grazr, "status") as status, \
+                contextlib.redirect_stderr(io.StringIO()) as usage:
+            self.assertEqual(grazr._dispatch(["grazr.py", "status", "--bogus"]), 2)
+
+        status.assert_not_called()
+        self.assertIn("usage: grazr.py", usage.getvalue())
+
+
 class StatuslineTest(EnrolledPairFixture):
     """grazr sits in Claude's status line, so it sees every message's reading
     and can move before the next one."""
@@ -5622,6 +5795,42 @@ class PinnedRotationSettingTest(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(grazr.set_setting("ACCOUNTS", "", self.path, enrolled=["a"]), 0)
         self.assertEqual(grazr.load_config(self.path).accounts, [])
+
+
+class EnabledSettingTest(unittest.TestCase):
+    """The Orca plugin's toggle writes ENABLED with `set`, as it writes PINNED_ROTATION."""
+
+    def setUp(self):
+        self.directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.directory, True)
+        self.path = os.path.join(self.directory, "config.env")
+
+    def write(self, text):
+        with open(self.path, "w") as handle:
+            handle.write(text)
+
+    def test_set_enabled_writes_the_flag_both_ways_and_keeps_its_comment(self):
+        self.write('ACCOUNTS="a"\nENABLED=1  # on\n')
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(grazr.set_setting("ENABLED", "0", self.path), 0)
+        with open(self.path) as handle:
+            self.assertEqual(handle.read(), 'ACCOUNTS="a"\nENABLED=0  # on\n')
+        self.assertFalse(grazr.load_config(self.path).enabled)
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            grazr.set_setting("ENABLED", "1", self.path)
+        self.assertTrue(grazr.load_config(self.path).enabled)
+
+    def test_set_enabled_rejects_anything_but_zero_or_one(self):
+        self.write('ACCOUNTS="a"\nENABLED=1\n')
+        printed = io.StringIO()
+
+        with contextlib.redirect_stdout(printed):
+            self.assertEqual(grazr.set_setting("ENABLED", "yes", self.path), 1)
+
+        self.assertEqual(printed.getvalue(), "grazr: ENABLED must be 0 or 1\n")
+        self.assertTrue(grazr.load_config(self.path).enabled)
 
 
 class PinsInstallTest(unittest.TestCase):

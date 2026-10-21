@@ -38,6 +38,9 @@ Config = namedtuple(
 
 Runtime = namedtuple("Runtime", "paths store state_dir config")
 
+# Reported by `status --json`.
+VERSION = "0.4.7+senad.6"
+
 DEFAULT_CONFIG = """\
 # Rotate when a limit group has less than this percent left.
 REMAINING_SESSION=15     # the 5-hour window
@@ -1569,16 +1572,21 @@ def _dispatch(argv):
     }
     if (command, len(argv)) in with_arguments:
         return with_arguments[(command, len(argv))]()
+    status_flags = {"--json": ("as_json", True), "--no-wait": ("wait", False)}
+    if command == "status" and len(argv) > 2 and all(flag in status_flags for flag in argv[2:]):
+        # The Orca plugin reads the report as JSON, and never waits on a key.
+        return status(**dict(status_flags[flag] for flag in argv[2:]))
     if command == "recover" and len(argv) == 4:
         # Detached from the failure hook, with the error and the account it hit.
         return recover(error=argv[2], failed=argv[3])
     if command == "swap" and len(argv) == 3:
         # A named account, from a script or another client. The action passes none.
         return swap(target=argv[2])
-    if command not in entry_points or (command == "install" and len(argv) != 2):
+    if (command not in entry_points or (command == "install" and len(argv) != 2)
+            or (command == "status" and len(argv) > 2)):
         print("usage: grazr.py %s" % "|".join(
             list(entry_points) + ["install --force", "pin PANE ACCOUNT", "unpin PANE", "token ACCOUNT",
-                                  "token-forget ACCOUNT", "set ACCOUNTS|PINNED_ROTATION VALUE"]
+                                  "token-forget ACCOUNT", "set ACCOUNTS|PINNED_ROTATION|ENABLED VALUE"]
         ), file=sys.stderr)
         return 2
     return entry_points[command]()
@@ -1766,8 +1774,100 @@ def _refuse_swap(reason):
     return 1
 
 
-def status(runtime=None):
-    paths, store, state_dir, config = runtime or _runtime()
+def status_report(runtime, now=None):
+    """Everything `status` shows, as data. The Orca plugin reads it over a pipe,
+    so every key is present, None where a value is unknown, and nothing here
+    waits on a key press."""
+    paths, store, state_dir, config = runtime
+    now = now or datetime.now(timezone.utc)
+    active = claude.active_account(paths)
+    everyone = accounts.load(paths, [])
+    enrolled_ids = {entry.id for entry in everyone}
+    ordered_ids = {entry.id for entry in accounts.load(paths, config.accounts)}
+    blocked = _read_blocked(state_dir, now)
+    statusline = claude.statusline_installed(paths.config_dir, _record_path(state_dir))
+    failure_hook = claude.failure_hook_installed(paths.config_dir, _failure_command(state_dir))
+    last = _last_rotation(state_dir)
+    return {
+        "installed": statusline and failure_hook,
+        "connection": {
+            "statusline": statusline,
+            "failure_hook": failure_hook,
+            "foreign": {
+                "statusline": claude.foreign_statusline(paths.config_dir, _shim_command(state_dir)),
+                "failure_hook": claude.foreign_failure_hook(paths.config_dir, _failure_command(state_dir)),
+            },
+        },
+        "active": None if active is None else {
+            "id": active,
+            "name": _name_of(everyone, active),
+            "enrolled": active in enrolled_ids,
+            "in_order": active in ordered_ids,
+        },
+        "accounts": [
+            {
+                "id": entry.id,
+                "name": entry.name,
+                "email": _email_of(paths, entry.id),
+                "parked": accounts.has_parked_credential(store, entry.id),
+                "snapshot": accounts.snapshot_to_json(entry.snapshot),
+                "blocked": blocked[entry.id].get("reason") if entry.id in blocked else None,
+                "in_order": entry.id in ordered_ids,
+                "first_reading_due": accounts.first_reading_due(paths, entry.id),
+            }
+            for entry in everyone
+        ],
+        "order": list(config.accounts),
+        "settings": {
+            "thresholds": config.thresholds,
+            "enabled": config.enabled,
+            "dry_run": config.dry_run,
+            "model_limits": config.model_limits,
+            "parked_poll_minutes": config.parked_poll_minutes,
+            "pinned_rotation": config.pinned_rotation,
+            "config_path": _config_path(),
+            "state_dir": state_dir,
+            # Same fallback as notify, so an empty GRAZR_NOTIFIER reads as Herdr there too.
+            "notifier": os.environ.get("GRAZR_NOTIFIER") or "herdr",
+        },
+        "blocked": {
+            identifier: {"reason": entry.get("reason"), "at": entry.get("at"), "until": entry.get("until")}
+            for identifier, entry in blocked.items()
+        },
+        "changed_at": last["at"] if last else None,
+        "last_rotation": last,
+        "last_reported": _last_decision(state_dir),
+        "managed_profile": managed_claude_home(),
+        "version": VERSION,
+    }
+
+
+def _email_of(paths, identifier):
+    try:
+        oauth = accounts.read(paths, identifier).get("oauthAccount")
+    except (OSError, ValueError):
+        return None
+    email = oauth.get("emailAddress") if isinstance(oauth, dict) else None
+    return email if isinstance(email, str) else None
+
+
+def _last_rotation(state_dir):
+    """The account the last swap moved to and when it landed, or None before any swap."""
+    try:
+        with open(os.path.join(state_dir, LAST_ROTATION)) as handle:
+            arrival = json.load(handle)
+        return {"to": arrival["to"], "at": float(arrival["at"])}
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def status(runtime=None, as_json=False, wait=True):
+    runtime = runtime or _runtime()
+    if as_json:
+        # The Orca plugin reads this over a pipe, so nothing else is printed.
+        print(json.dumps(status_report(runtime), indent=2, sort_keys=True))
+        return 0
+    paths, store, state_dir, config = runtime
     active = claude.active_account(paths)
 
     print("config: %s" % _config_path())
@@ -1827,6 +1927,9 @@ def status(runtime=None):
     last = _last_decision(state_dir)
     if last:
         print("\nlast reported: %s" % last)
+    if not wait:
+        print("\n(* = active)")
+        return 0
     print("\n(* = active)   press any key to close")
     read_key()
     return 0
@@ -2049,7 +2152,7 @@ def token_forget(runtime=None, target=None):
     return 0
 
 
-SETTABLE = {"ACCOUNTS": None, "PINNED_ROTATION": pins.ROTATION_MODES}
+SETTABLE = {"ACCOUNTS": None, "PINNED_ROTATION": pins.ROTATION_MODES, "ENABLED": ("0", "1")}
 
 
 def set_setting(key, value, path=None, enrolled=None):
