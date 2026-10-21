@@ -23,6 +23,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- A user's own status bar that runs another grazr is refused by `install`,
+  even with `--force`, and reported as another grazr's. Before, the bar was
+  left alone while the failure hook was still taken, which split ownership.
+- A hand-written StopFailure hook that runs grazr is now refused as another
+  grazr's instead of being replaced silently.
+- The status line prints the bar configured before grazr before reading
+  config.env, so a config error shows after the bar rather than instead of it.
 - Inside an Orca-managed Claude account (`CLAUDE_CONFIG_DIR` under
   `claude-profiles/`, or `ORCA_CLAUDE_INJECTED_CONFIG_DIR`) grazr only runs
   the previous status bar: it reads nothing, rotates nothing, and `swap`,
