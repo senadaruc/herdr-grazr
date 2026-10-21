@@ -168,6 +168,9 @@ def tag_all(name, spawn=subprocess.run, pinned=None):
     without that row nothing appears. Best-effort: a tag is never worth
     failing a rotation over.
     """
+    # Without a Herdr binary there is no pane to tag, so nothing is asked.
+    if not os.environ.get("HERDR_BIN_PATH"):
+        return
     pinned = pinned or {}
     for pane_id, tokens in _claude_panes(spawn):
         wanted = pinned.get(pane_id, name)
@@ -179,7 +182,7 @@ def tag_pane(pane_id, name, spawn=subprocess.run):
     """One pane, unless it is being read. Herdr can snap a scrolled viewport
     back to the bottom when it repaints metadata, and a pane nobody was
     watching must not jump because another pane rotated."""
-    if not pane_id or _is_scrolled(pane_id, spawn):
+    if not os.environ.get("HERDR_BIN_PATH") or not pane_id or _is_scrolled(pane_id, spawn):
         return
     _herdr(spawn, "pane", "report-metadata", pane_id, "--source", TAG,
            "--token", "%s=%s" % (TAG, name))
@@ -202,6 +205,8 @@ def _claude_panes(spawn):
 
 def _live_panes(spawn=subprocess.run):
     """Every pane id Herdr knows, or None when it could not say."""
+    if not os.environ.get("HERDR_BIN_PATH"):
+        return None
     answer = _herdr(spawn, "pane", "list")
     try:
         return [entry["pane_id"] for entry in json.loads(answer)["result"]["panes"]]
@@ -552,7 +557,12 @@ def _runtime():
 
 
 def _paths():
-    state_dir = os.environ.get("HERDR_PLUGIN_STATE_DIR") or os.path.expanduser("~/.grazr")
+    # GRAZR_STATE_DIR is what a host other than Herdr sets, such as Orca.
+    state_dir = (
+        os.environ.get("GRAZR_STATE_DIR")
+        or os.environ.get("HERDR_PLUGIN_STATE_DIR")
+        or os.path.expanduser("~/.grazr")
+    )
     accounts_dir = os.path.join(state_dir, "accounts")
     os.makedirs(accounts_dir, exist_ok=True)
     # With CLAUDE_CONFIG_DIR set, Claude keeps its .claude.json inside that
@@ -574,7 +584,11 @@ def _paths():
 
 
 def _config_path():
-    directory = os.environ.get("HERDR_PLUGIN_CONFIG_DIR") or os.path.expanduser("~/.grazr")
+    directory = (
+        os.environ.get("GRAZR_CONFIG_DIR")
+        or os.environ.get("HERDR_PLUGIN_CONFIG_DIR")
+        or os.path.expanduser("~/.grazr")
+    )
     return os.path.join(directory, "config.env")
 
 
@@ -1508,13 +1522,21 @@ def _record_path(state_dir):
 
 def _shim_command(state_dir, entry="statusline"):
     """The status line runs in Claude's environment, not herdr's, so the
-    command carries the directories herdr would have set."""
-    return "HERDR_PLUGIN_STATE_DIR=%s HERDR_PLUGIN_CONFIG_DIR=%s python3 %s %s" % (
-        shlex.quote(state_dir),
-        shlex.quote(os.path.dirname(_config_path())),
-        shlex.quote(os.path.abspath(__file__)),
-        entry,
-    )
+    command carries the directories herdr would have set. A host that sets
+    GRAZR_STATE_DIR gets that pair instead, and the notifier choice rides
+    along, since decide and recover inherit it from this command."""
+    config_dir = shlex.quote(os.path.dirname(_config_path()))
+    if os.environ.get("GRAZR_STATE_DIR"):
+        pair = "GRAZR_STATE_DIR=%s GRAZR_CONFIG_DIR=%s" % (shlex.quote(state_dir), config_dir)
+    else:
+        pair = "HERDR_PLUGIN_STATE_DIR=%s HERDR_PLUGIN_CONFIG_DIR=%s" % (
+            shlex.quote(state_dir),
+            config_dir,
+        )
+    notifier = os.environ.get("GRAZR_NOTIFIER")
+    if notifier:
+        pair += " GRAZR_NOTIFIER=%s" % shlex.quote(notifier)
+    return "%s python3 %s %s" % (pair, shlex.quote(os.path.abspath(__file__)), entry)
 
 
 def _failure_command(state_dir):

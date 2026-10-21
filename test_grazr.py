@@ -1949,6 +1949,48 @@ class PathResolutionTest(unittest.TestCase):
 
         self.assertEqual(paths.config_path, os.path.expanduser("~/.claude.json"))
 
+    def test_grazr_state_dir_wins_over_herdr_plugin_state_dir(self):
+        """Orca sets GRAZR_STATE_DIR and has no Herdr, so its value wins
+        whenever both are present."""
+        grazr_dir = os.path.join(self.directory, "grazr")
+        herdr_dir = os.path.join(self.directory, "herdr")
+        paths, _, state_dir = self.paths_on(
+            False, {"GRAZR_STATE_DIR": grazr_dir, "HERDR_PLUGIN_STATE_DIR": herdr_dir}
+        )
+
+        self.assertEqual(state_dir, grazr_dir)
+        self.assertEqual(paths.accounts_dir, os.path.join(grazr_dir, "accounts"))
+
+    def test_herdr_plugin_state_dir_alone_is_unchanged(self):
+        herdr_dir = os.path.join(self.directory, "herdr")
+        with mock.patch.dict(os.environ, {"HERDR_PLUGIN_STATE_DIR": herdr_dir}):
+            os.environ.pop("GRAZR_STATE_DIR", None)
+            _, _, state_dir = grazr._paths()
+
+        self.assertEqual(state_dir, herdr_dir)
+
+    def test_an_empty_grazr_state_dir_counts_as_unset(self):
+        herdr_dir = os.path.join(self.directory, "herdr")
+        _, _, state_dir = self.paths_on(
+            False, {"GRAZR_STATE_DIR": "", "HERDR_PLUGIN_STATE_DIR": herdr_dir}
+        )
+
+        self.assertEqual(state_dir, herdr_dir)
+
+    def test_grazr_config_dir_wins_over_herdr_plugin_config_dir(self):
+        grazr_dir = os.path.join(self.directory, "grazr")
+        herdr_dir = os.path.join(self.directory, "herdr")
+        with mock.patch.dict(
+            os.environ, {"GRAZR_CONFIG_DIR": grazr_dir, "HERDR_PLUGIN_CONFIG_DIR": herdr_dir}
+        ):
+            self.assertEqual(grazr._config_path(), os.path.join(grazr_dir, "config.env"))
+
+    def test_herdr_plugin_config_dir_alone_is_unchanged(self):
+        herdr_dir = os.path.join(self.directory, "herdr")
+        with mock.patch.dict(os.environ, {"HERDR_PLUGIN_CONFIG_DIR": herdr_dir}):
+            os.environ.pop("GRAZR_CONFIG_DIR", None)
+            self.assertEqual(grazr._config_path(), os.path.join(herdr_dir, "config.env"))
+
 
 class PaneTagTest(unittest.TestCase):
     """The sidebar tag. Herdr shows it only where the user's own row names
@@ -2012,6 +2054,45 @@ class PaneTagTest(unittest.TestCase):
 
         self.assertIn("--token", self.reported[0])
         self.assertIn("grazr=personal", self.reported[0])
+
+
+class HerdrlessPaneTest(unittest.TestCase):
+    """With no Herdr binary there is no pane to tag and no pane list to read,
+    so grazr asks nothing and spawns nothing."""
+
+    def setUp(self):
+        self.calls = []
+
+    def spawn(self, argv, **kwargs):
+        self.calls.append(argv)
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"result": {"pane": {"scroll": {"offset_from_bottom": 0}}}}),
+        )
+
+    def test_tag_all_spawns_nothing_without_a_herdr_binary(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(grazr.tag_all("work", spawn=self.spawn))
+
+        self.assertEqual(self.calls, [])
+
+    def test_tag_pane_spawns_nothing_without_a_herdr_binary(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(grazr.tag_pane("p1", "work", spawn=self.spawn))
+
+        self.assertEqual(self.calls, [])
+
+    def test_live_panes_is_unknown_without_a_herdr_binary(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(grazr._live_panes(spawn=self.spawn))
+
+        self.assertEqual(self.calls, [])
+
+    def test_tag_pane_still_asks_herdr_when_the_binary_is_set(self):
+        with mock.patch.dict(os.environ, {"HERDR_BIN_PATH": "/usr/bin/herdr"}):
+            grazr.tag_pane("p1", "work", spawn=self.spawn)
+
+        self.assertEqual(self.calls[0][0], "/usr/bin/herdr")
 
 
 class AtomicWriteTest(unittest.TestCase):
@@ -3276,6 +3357,62 @@ class StatuslineTest(EnrolledPairFixture):
         self.run_statusline(self.payload(used=90))
 
         self.assertEqual(self.rotations, [])
+
+
+class ShimCommandTest(unittest.TestCase):
+    """The command the status line and failure hook run inside Claude. It has
+    to carry the directories and the notifier choice, since Claude's
+    environment has none of them."""
+
+    def command(self, environment, state_dir="/s"):
+        with mock.patch.dict(os.environ, environment, clear=True):
+            return grazr._shim_command(state_dir)
+
+    def script(self):
+        return shlex.quote(os.path.abspath(grazr.__file__))
+
+    def test_without_grazr_env_it_is_herdrs_pair_exactly_as_before(self):
+        config = shlex.quote(os.path.expanduser("~/.grazr"))
+
+        self.assertEqual(
+            self.command({}),
+            "HERDR_PLUGIN_STATE_DIR=/s HERDR_PLUGIN_CONFIG_DIR=%s python3 %s statusline"
+            % (config, self.script()),
+        )
+
+    def test_grazr_state_dir_replaces_herdrs_pair(self):
+        config = shlex.quote(os.path.expanduser("~/.grazr"))
+        command = self.command({"GRAZR_STATE_DIR": "/s"})
+
+        self.assertEqual(
+            command,
+            "GRAZR_STATE_DIR=/s GRAZR_CONFIG_DIR=%s python3 %s statusline"
+            % (config, self.script()),
+        )
+        self.assertNotIn("HERDR_PLUGIN_", command)
+
+    def test_the_notifier_rides_along_before_python(self):
+        """The status line and failure hook run in Claude's environment, and
+        decide inherits its choice from the command, so it is baked in here."""
+        config = shlex.quote(os.path.expanduser("~/.grazr"))
+
+        self.assertEqual(
+            self.command({"GRAZR_NOTIFIER": "queue,osascript"}),
+            "HERDR_PLUGIN_STATE_DIR=/s HERDR_PLUGIN_CONFIG_DIR=%s "
+            "GRAZR_NOTIFIER=queue,osascript python3 %s statusline" % (config, self.script()),
+        )
+
+    def test_a_notifier_value_needing_quotes_is_shell_quoted(self):
+        self.assertIn(" GRAZR_NOTIFIER='a b' python3 ", self.command({"GRAZR_NOTIFIER": "a b"}))
+
+    def test_the_failure_command_ends_with_failure_and_carries_the_same_prefix(self):
+        environment = {"GRAZR_STATE_DIR": "/s", "GRAZR_NOTIFIER": "queue"}
+        with mock.patch.dict(os.environ, environment, clear=True):
+            status = grazr._shim_command("/s")
+            failure = grazr._failure_command("/s")
+
+        self.assertTrue(failure.endswith(" failure"), failure)
+        self.assertEqual(failure, status[: -len("statusline")] + "failure")
 
 
 class ConnectTest(EnrolledPairFixture):
@@ -4579,7 +4716,9 @@ class PinnedRotationTest(EnrolledPairFixture):
                 return json.dumps({"result": {"pane": {"scroll": {"offset_from_bottom": 0}}}})
             return json.dumps(answers.get(arguments[:2], {}))
 
-        with mock.patch.object(grazr, "_herdr", herdr):
+        with mock.patch.object(grazr, "_herdr", herdr), mock.patch.dict(
+            os.environ, {"HERDR_BIN_PATH": "/usr/bin/herdr"}
+        ):
             grazr.tag_all("work", pinned=grazr._pinned_labels(self.state_dir, accounts.load(self.runtime().paths, [])))
 
         self.assertEqual(tagged, [("w1:p1", "grazr=personal · pinned"), ("w1:p2", "grazr=work")])
