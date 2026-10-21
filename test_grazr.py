@@ -3493,6 +3493,12 @@ class ShimPartsTest(unittest.TestCase):
             with self.subTest(command=command):
                 self.assertIsNone(claude.shim_parts(command))
 
+    def test_a_trailing_slash_on_the_state_dir_is_the_same_owner(self):
+        self.assertTrue(claude.same_owner(
+            "HERDR_PLUGIN_STATE_DIR=/s/ python3 /a/grazr.py statusline",
+            "HERDR_PLUGIN_STATE_DIR=/s python3 /a/grazr.py statusline",
+        ))
+
     def test_owners_are_the_same_when_the_state_dir_is(self):
         self.assertTrue(claude.same_owner(
             "HERDR_PLUGIN_STATE_DIR=/s python3 /a/grazr.py statusline",
@@ -3620,6 +3626,28 @@ class ConnectTest(EnrolledPairFixture):
         self.assertIn("another grazr (state in %s)" % other, printed)
         self.assertEqual(self.raw_settings(), before)
         self.assertFalse(os.path.exists(grazr._record_path(self.state_dir)))
+
+    def test_status_still_reports_when_settings_json_is_not_valid(self):
+        with open(os.path.join(self.claude_dir, "settings.json"), "w") as handle:
+            handle.write("{ not json")
+
+        code, printed = self.invoke(grazr.status)
+
+        self.assertIn("active account headroom", printed)
+
+    def test_a_bar_naming_our_state_dir_in_double_quotes_with_a_space_is_ours(self):
+        """A bar of the user's that sets the state dir with a space in it."""
+        state = os.path.join(self.directory, "my dir")
+        os.makedirs(state)
+        with open(grazr._record_path(state), "w") as handle:
+            json.dump({"previous": None, "shim": "GRAZR_STATE_DIR='%s' python3 /p/grazr.py statusline" % state}, handle)
+        bar = ('input=$(cat); g=$(echo x | GRAZR_STATE_DIR="%s" python3 /x/grazr.py statusline); printf "%%s" "$g"' % state)
+        self.write_settings({"statusLine": {"type": "command", "command": bar}})
+
+        self.assertTrue(claude.statusline_installed(self.claude_dir, grazr._record_path(state)))
+        other = bar.replace(state, os.path.join(self.directory, "other dir"))
+        self.write_settings({"statusLine": {"type": "command", "command": other}})
+        self.assertFalse(claude.statusline_installed(self.claude_dir, grazr._record_path(state)))
 
     def write_settings(self, settings):
         with open(os.path.join(self.claude_dir, "settings.json"), "w") as handle:
@@ -4703,6 +4731,15 @@ class FailureHookInstallTest(unittest.TestCase):
         claude.uninstall_failure_hook(self.config_dir, self.COMMAND)
 
         self.assertEqual(self.read()["hooks"]["StopFailure"], [theirs])
+
+    def test_a_group_of_ours_without_a_type_key_counts_as_ours(self):
+        self.write({"hooks": {"StopFailure": [
+            {"matcher": claude.FAILURE_HOOK_MATCHER, "hooks": [{"command": self.COMMAND}]},
+        ]}})
+
+        claude.install_failure_hook(self.config_dir, self.COMMAND)
+
+        self.assertEqual(self.read()["hooks"]["StopFailure"], [self.ours()])
 
     def test_the_connect_action_installs_both(self):
         state_dir = tempfile.mkdtemp()

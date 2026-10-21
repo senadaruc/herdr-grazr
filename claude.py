@@ -650,8 +650,15 @@ def carried_state_dir(command):
 
 
 def same_owner(a, b):
-    """Both are grazr shims, and they carry the same state dir."""
-    return is_shim(a) and is_shim(b) and carried_state_dir(a) == carried_state_dir(b)
+    """Both are grazr shims, and they carry the same state dir once paths are
+    normalised, so "/s/" and "/s" are one owner."""
+    if not (is_shim(a) and is_shim(b)):
+        return False
+    return _normal_dir(carried_state_dir(a)) == _normal_dir(carried_state_dir(b))
+
+
+def _normal_dir(state_dir):
+    return os.path.normpath(state_dir) if state_dir else state_dir
 
 
 def _is_ours(entry, shim):
@@ -661,7 +668,11 @@ def _is_ours(entry, shim):
 def foreign_statusline(config_dir, shim):
     """The state dir of another grazr whose shim holds Claude's status line, or
     None. A shim that carries no state dir is reported as ~/.grazr."""
-    current = _read_settings(config_dir).get("statusLine")
+    try:
+        current = _read_settings(config_dir).get("statusLine")
+    except RuntimeError:
+        # Unreadable settings are reported where they are touched, not here.
+        return None
     if is_shim(current) and not same_owner(current, shim):
         return _state_label(carried_state_dir(current))
     return None
@@ -687,8 +698,16 @@ def _embedded_state_dirs(entry):
     """The state dirs a bar names in its own command. A bar of the user's that
     calls grazr for one segment is told apart by whose state dir it names."""
     command = entry.get("command", "") if isinstance(entry, dict) else (entry or "")
-    pattern = r"(?:%s)=('[^']*'|\S+)" % "|".join(STATE_DIR_VARS)
-    return [value.strip("'") for value in re.findall(pattern, command)]
+    pattern = r"(?:%s)=(\"[^\"]*\"|'[^']*'|\S+)" % "|".join(STATE_DIR_VARS)
+    return [_unquote(value) for value in re.findall(pattern, command)]
+
+
+def _unquote(value):
+    try:
+        words = shlex.split(value)
+    except ValueError:
+        return value
+    return words[0] if words else ""
 
 
 # The StopFailure errors that say the account itself is the problem. Claude
@@ -719,7 +738,7 @@ def install_failure_hook(config_dir, command, force=False):
     foreign = [group for group in groups if _is_foreign_failure_group(group, command)]
     if foreign and not force:
         raise RuntimeError("Claude's StopFailure hook already belongs to another grazr (state in %s); disconnect it there, or run install --force to take it over" % _group_state(foreign[0]))
-    hooks[FAILURE_HOOK_EVENT] = [group for group in groups if not _grazr_failure_group(group)] + [wanted]
+    hooks[FAILURE_HOOK_EVENT] = [group for group in groups if _grazr_failure_state(group) is None] + [wanted]
     _write_settings(config_dir, settings)
     return "Failure hook connected"
 
@@ -742,6 +761,8 @@ def uninstall_failure_hook(config_dir, command):
 
 
 def failure_hook_installed(config_dir, command):
+    """Matched by state dir, not path, so a hook left at a deleted plugin path
+    still reads as connected. The status line has always matched the same way."""
     try:
         hooks = _read_settings(config_dir).get("hooks")
     except RuntimeError:
@@ -770,11 +791,11 @@ def foreign_owner(config_dir, shim, failure_command):
 
 def _failure_group_command(group):
     """The command of a group grazr wrote, which holds only its own failure
-    shim. None for any other group."""
+    shim, whatever else the hook says. None for any other group."""
     if not isinstance(group, dict) or not isinstance(group.get("hooks"), list) or len(group["hooks"]) != 1:
         return None
     hook = group["hooks"][0]
-    if not isinstance(hook, dict) or hook.get("type") != "command":
+    if not isinstance(hook, dict):
         return None
     parts = shim_parts(hook.get("command"))
     return hook["command"] if parts is not None and parts[0] == "failure" else None
@@ -788,14 +809,20 @@ def _is_grazr_failure_command(command):
     return isinstance(command, str) and "grazr.py" in command and command.rstrip().endswith(" failure")
 
 
-def _grazr_failure_group(group):
-    """A group whose every hook calls grazr's StopFailure. Groups of hooks that
-    are not grazr's are never one of these."""
+def _grazr_failure_state(group):
+    """The state dir of the grazr a StopFailure group belongs to, "" when its
+    command carries none, or None when the group is not grazr's. Every hook in
+    the group must call grazr. A group that mixes a grazr hook with one that is
+    not grazr's is deliberately neither ours nor foreign, so it is left alone.
+    """
     hooks = group.get("hooks") if isinstance(group, dict) else None
-    return isinstance(hooks, list) and bool(hooks) and all(
-        isinstance(hook, dict) and _is_grazr_failure_command(hook.get("command"))
-        for hook in hooks
-    )
+    if not isinstance(hooks, list) or not hooks:
+        return None
+    commands = [hook.get("command") if isinstance(hook, dict) else None for hook in hooks]
+    if not all(_is_grazr_failure_command(command) for command in commands):
+        return None
+    state = carried_state_dir(commands[0])
+    return "" if state is None else state
 
 
 def _is_our_failure_group(group, command):
@@ -803,11 +830,11 @@ def _is_our_failure_group(group, command):
 
 
 def _is_foreign_failure_group(group, command):
-    return _grazr_failure_group(group) and not _is_our_failure_group(group, command)
+    return _grazr_failure_state(group) is not None and not _is_our_failure_group(group, command)
 
 
 def _group_state(group):
-    return _state_label(carried_state_dir(group["hooks"][0]["command"]))
+    return _state_label(_grazr_failure_state(group))
 
 
 def _read_record(record_path):
