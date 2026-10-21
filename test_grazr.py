@@ -1991,6 +1991,16 @@ class PathResolutionTest(unittest.TestCase):
             os.environ.pop("GRAZR_CONFIG_DIR", None)
             self.assertEqual(grazr._config_path(), os.path.join(herdr_dir, "config.env"))
 
+    def test_the_state_dir_is_grazr_then_herdr_then_home(self):
+        grazr_dir = os.path.join(self.directory, "grazr")
+        herdr_dir = os.path.join(self.directory, "herdr")
+        with mock.patch.dict(os.environ, {"GRAZR_STATE_DIR": grazr_dir, "HERDR_PLUGIN_STATE_DIR": herdr_dir}):
+            self.assertEqual(grazr._state_dir(), grazr_dir)
+            del os.environ["GRAZR_STATE_DIR"]
+            self.assertEqual(grazr._state_dir(), herdr_dir)
+            del os.environ["HERDR_PLUGIN_STATE_DIR"]
+            self.assertEqual(grazr._state_dir(), os.path.expanduser("~/.grazr"))
+
 
 class PaneTagTest(unittest.TestCase):
     """The sidebar tag. Herdr shows it only where the user's own row names
@@ -3856,6 +3866,132 @@ class FailureHookTest(EnrolledPairFixture):
                 grazr._dispatch(["grazr.py", "recover", "billing_error", "uuid-work"]),
                 {"error": "billing_error", "failed": "uuid-work"},
             )
+
+
+class ManagedProfileGuardTest(EnrolledPairFixture):
+    """Orca runs Claude on accounts it manages, under <userData>/claude-profiles.
+    grazr must read, write and rotate nothing there: only the System default
+    login is grazr's to rotate."""
+
+    MANAGED = "/orca/claude-profiles/abc/home"
+
+    def payload(self, used):
+        return json.dumps({"rate_limits": {"five_hour": {
+            "used_percentage": used, "resets_at": None,
+        }}})
+
+    def run_statusline(self, payload, **environment):
+        return self.invoke(
+            lambda runtime: grazr.statusline(
+                runtime, payload, detach=lambda: grazr.decide(runtime)
+            ),
+            **environment
+        )
+
+    def test_a_managed_pane_rotates_and_records_nothing(self):
+        self.run_statusline(self.payload(used=90), ORCA_CLAUDE_INJECTED_CONFIG_DIR=self.MANAGED)
+
+        self.assertEqual(self.rotations, [])
+        with open(os.path.join(self.state_dir, "accounts", "uuid-work.json")) as handle:
+            self.assertNotIn("snapshot", json.load(handle))
+        self.assertFalse(os.path.exists(os.path.join(self.state_dir, "grazr.log")))
+        self.assertEqual(self.notices, [])
+
+    def test_a_managed_pane_still_shows_the_bar_configured_before(self):
+        with open(os.path.join(self.state_dir, "statusline.previous.json"), "w") as handle:
+            json.dump({"previous": {"type": "command", "command": "printf 'inner bar'"},
+                       "shim": "python3 grazr.py statusline"}, handle)
+
+        _, printed = self.run_statusline(self.payload(used=10), ORCA_CLAUDE_INJECTED_CONFIG_DIR=self.MANAGED)
+
+        self.assertEqual(printed, "inner bar")
+
+    def test_the_path_alone_marks_a_managed_pane(self):
+        profile = "/Users/x/Library/Application Support/orca/claude-profiles/p1/home"
+
+        self.run_statusline(self.payload(used=90), CLAUDE_CONFIG_DIR=profile)
+
+        self.assertEqual(self.rotations, [])
+
+    def test_an_isolated_config_dir_outside_the_profiles_still_rotates(self):
+        self.run_statusline(self.payload(used=90), CLAUDE_CONFIG_DIR=os.path.join(self.directory, "isolated"))
+
+        self.assertEqual(self.rotations[0][2:4], ("uuid-work", "uuid-personal"))
+
+    def test_the_failure_hook_starts_no_recovery_in_a_managed_pane(self):
+        detached = []
+        payload = json.dumps({"error": "billing_error"})
+
+        self.invoke(
+            lambda runtime: grazr.failure(runtime, payload, detach=lambda: detached.append(1)),
+            ORCA_CLAUDE_INJECTED_CONFIG_DIR=self.MANAGED,
+        )
+
+        self.assertEqual(detached, [])
+
+    def test_decide_and_recover_do_nothing_in_a_managed_pane(self):
+        self.write_account_snapshot("uuid-work", remaining=5)
+        # Spies, so a missing guard fails here rather than reading real usage.
+        usage_read = lambda *a, **k: self.fail("usage read in a managed pane")
+
+        with mock.patch.object(grazr, "_refresh_scoped", usage_read), mock.patch.object(
+            grazr, "_refresh_parked", usage_read
+        ):
+            decided, _ = self.invoke(grazr.decide, ORCA_CLAUDE_INJECTED_CONFIG_DIR=self.MANAGED)
+            recovered, _ = self.invoke(
+                lambda runtime: grazr.recover(runtime, error="billing_error", failed="uuid-work"),
+                ORCA_CLAUDE_INJECTED_CONFIG_DIR=self.MANAGED,
+            )
+
+        self.assertEqual((decided, recovered, self.rotations), (0, 0, []))
+
+    def test_swap_refuses_and_rotates_nothing(self):
+        code, printed = self.invoke(
+            lambda runtime: grazr.swap(runtime, target="personal"),
+            ORCA_CLAUDE_INJECTED_CONFIG_DIR=self.MANAGED,
+        )
+
+        self.assertEqual(code, 1)
+        self.assertIn("Orca-managed", printed)
+        self.assertIn(self.MANAGED, printed)
+        self.assertEqual(self.rotations, [])
+
+    def test_refresh_refuses_before_reading_any_usage(self):
+        with mock.patch.object(
+            grazr, "_refresh_parked", lambda *a, **k: self.fail("usage read in a managed pane")
+        ):
+            code, printed = self.invoke(grazr.refresh, ORCA_CLAUDE_INJECTED_CONFIG_DIR=self.MANAGED)
+
+        self.assertEqual(code, 1)
+        self.assertIn("Orca-managed", printed)
+
+    def test_enrol_refuses_before_offering_the_menu(self):
+        with mock.patch.object(grazr, "read_key", self.fail):
+            code, printed = self.invoke(grazr.enrol, ORCA_CLAUDE_INJECTED_CONFIG_DIR=self.MANAGED)
+
+        self.assertEqual(code, 1)
+        self.assertIn("Orca-managed", printed)
+        self.assertNotIn("Save the login", printed)
+
+    def test_status_says_why_it_will_not_rotate(self):
+        with mock.patch.object(grazr, "read_key", lambda: "q"):
+            _, printed = self.invoke(grazr.status, ORCA_CLAUDE_INJECTED_CONFIG_DIR=self.MANAGED)
+
+        self.assertIn("Orca-managed", printed)
+
+    def test_the_injected_variable_names_the_managed_home(self):
+        with mock.patch.dict(os.environ, {"ORCA_CLAUDE_INJECTED_CONFIG_DIR": self.MANAGED}, clear=True):
+            self.assertEqual(grazr.managed_claude_home(), self.MANAGED)
+
+    def test_a_config_dir_inside_claude_profiles_is_managed(self):
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": self.MANAGED}, clear=True):
+            self.assertEqual(grazr.managed_claude_home(), self.MANAGED)
+
+    def test_the_system_default_login_is_not_managed(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(grazr.managed_claude_home())
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": "/tmp/isolated"}, clear=True):
+            self.assertIsNone(grazr.managed_claude_home())
 
 
 class RecoverTest(EnrolledPairFixture):

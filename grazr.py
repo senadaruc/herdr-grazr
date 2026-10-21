@@ -556,13 +556,17 @@ def _runtime():
     )
 
 
-def _paths():
+def _state_dir():
     # GRAZR_STATE_DIR is what a host other than Herdr sets, such as Orca.
-    state_dir = (
+    return (
         os.environ.get("GRAZR_STATE_DIR")
         or os.environ.get("HERDR_PLUGIN_STATE_DIR")
         or os.path.expanduser("~/.grazr")
     )
+
+
+def _paths():
+    state_dir = _state_dir()
     accounts_dir = os.path.join(state_dir, "accounts")
     os.makedirs(accounts_dir, exist_ok=True)
     # With CLAUDE_CONFIG_DIR set, Claude keeps its .claude.json inside that
@@ -592,15 +596,33 @@ def _config_path():
     return os.path.join(directory, "config.env")
 
 
+def managed_claude_home():
+    """The config dir of the Orca-managed Claude account this process runs in,
+    or None for the System default login, which is the only one grazr rotates.
+    Not cached: the environment is read each time, so a test can change it."""
+    injected = os.environ.get("ORCA_CLAUDE_INJECTED_CONFIG_DIR")
+    if injected:
+        return injected
+    # Orca's profiles live under .../claude-profiles/, on every launch path.
+    isolated = os.environ.get("CLAUDE_CONFIG_DIR")
+    if isolated and "/claude-profiles/" in isolated:
+        return isolated
+    return None
+
+
 def statusline(runtime=None, payload=None, spawn=subprocess.run, detach=None):
     """Runs inside Claude after every message, with the status-line payload on
     stdin. The bar stays the one configured before grazr. Claude cancels this
     command when the next update arrives, so the swap runs detached, in
     `decide`, where a kill cannot leave it half done."""
     payload = sys.stdin.read() if payload is None else payload
+    state_dir = runtime.state_dir if runtime else _state_dir()
+    print(_previous_bar(state_dir, payload, spawn), end="", flush=True)
+    # Orca's usage chip is the bar printed above. Nothing below runs in a managed pane.
+    if managed_claude_home():
+        return 0
     runtime = runtime or _runtime()
     paths, store, state_dir, config = runtime
-    print(_previous_bar(state_dir, payload, spawn), end="", flush=True)
 
     if not config.enabled:
         return 0
@@ -900,6 +922,9 @@ def _current_parked_login(runtime, entry, now):
 def refresh(runtime=None):
     """Read every account's usage now, the live one too, whatever the interval.
     For a client that wants current numbers on demand."""
+    home = managed_claude_home()
+    if home:
+        return _refuse_managed(home)
     runtime = runtime or _runtime()
     now = datetime.now(timezone.utc)
     pins.prune(runtime.state_dir, _live_panes())
@@ -1032,6 +1057,8 @@ def decide(runtime=None):
     that recorded it, so Claude cancelling that cannot stop a swap half way.
     The parked accounts are read afterwards, so their requests never hold up
     a swap that is due now."""
+    if managed_claude_home():
+        return 0
     runtime = runtime or _runtime()
     try:
         return _decide(runtime)
@@ -1093,6 +1120,8 @@ def failure(runtime=None, payload=None, detach=None):
     payload = sys.stdin.read() if payload is None else payload
     runtime = runtime or _runtime()
     paths, _, state_dir, config = runtime
+    if managed_claude_home():
+        return 0
     if not config.enabled:
         return 0
     try:
@@ -1134,6 +1163,8 @@ def recover(runtime=None, error=None, failed=None, now=None):
     acts: the rest find another account live, or the one that failed arrived a
     moment ago and their requests were already out before it did. Unlike
     `decide`, this waits for the lock, since no later message brings a retry."""
+    if managed_claude_home():
+        return 0
     runtime = runtime or _runtime()
     paths, store, state_dir, config = runtime
     now = now or datetime.now(timezone.utc)
@@ -1480,6 +1511,7 @@ def tag(runtime=None):
     longer grazr's, since without it grazr sees nothing."""
     paths, _, state_dir, _ = runtime or _runtime()
     enrolled = accounts.load(paths, [])
+    # Pane identity seam: Orca's equivalent is ORCA_PANE_KEY (pins under Orca, later).
     pane_id = os.environ.get("HERDR_PANE_ID")
     pinned = _pinned_labels(state_dir, enrolled)
     _refresh_shim(state_dir)
@@ -1552,6 +1584,9 @@ def swap(runtime=None, target=None):
     grazr pick. Naming it is the choice, so it is taken from every enrolled
     account, listed in ACCOUNTS or not, and its headroom is not consulted
     either."""
+    home = managed_claude_home()
+    if home:
+        return _refuse_managed(home)
     runtime = runtime or _runtime()
     paths, store, state_dir, config = runtime
     now = datetime.now(timezone.utc)
@@ -1612,6 +1647,11 @@ def swap(runtime=None, target=None):
     return 0
 
 
+def _refuse_managed(home):
+    print("grazr: this terminal runs an Orca-managed Claude account (%s); grazr only rotates the System default login" % home)
+    return 1
+
+
 def _refuse_swap(reason):
     """The user pressed a key and is watching, so a refusal goes to the screen
     as well as the log."""
@@ -1628,6 +1668,9 @@ def status(runtime=None):
     print("thresholds: session %d%% / weekly %d%% remaining%s\n"
           % (config.thresholds["session"], config.thresholds["weekly"],
              "   DRY_RUN" if config.dry_run else ""))
+    home = managed_claude_home()
+    if home:
+        print("  This terminal runs an Orca-managed Claude account (%s); grazr only rotates the System default login\n" % home)
 
     enrolled = accounts.load(paths, config.accounts)
     blocked = _read_blocked(state_dir, datetime.now(timezone.utc))
@@ -1703,6 +1746,9 @@ def _describe(snapshot):
 
 
 def enrol(runtime=None):
+    home = managed_claude_home()
+    if home:
+        return _refuse_managed(home)
     # No title here: the pane border already carries it.
     print("  (s) Save the login this machine is using now")
     print("  (l) Log in to another account, without touching the current one")
