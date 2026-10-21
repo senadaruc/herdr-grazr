@@ -1118,10 +1118,11 @@ def failure(runtime=None, payload=None, detach=None):
     the rotation runs detached like `decide`, keyed to the account that was
     live when the hook fired."""
     payload = sys.stdin.read() if payload is None else payload
-    runtime = runtime or _runtime()
-    paths, _, state_dir, config = runtime
+    # Before the runtime: building one creates the accounts dir and reads config.
     if managed_claude_home():
         return 0
+    runtime = runtime or _runtime()
+    paths, _, state_dir, config = runtime
     if not config.enabled:
         return 0
     try:

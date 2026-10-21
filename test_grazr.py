@@ -3897,6 +3897,37 @@ class ManagedProfileGuardTest(EnrolledPairFixture):
         self.assertFalse(os.path.exists(os.path.join(self.state_dir, "grazr.log")))
         self.assertEqual(self.notices, [])
 
+    def run_without_runtime(self, call, payload):
+        """Runs an entry point the way Claude starts it: no runtime handed in,
+        so it builds one from the environment. Returns what it printed."""
+        state = os.path.join(self.directory, "fresh")
+        os.makedirs(state)
+        environment = {
+            "GRAZR_STATE_DIR": state, "HOME": self.directory,
+            "ORCA_CLAUDE_INJECTED_CONFIG_DIR": self.MANAGED,
+        }
+        printed = io.StringIO()
+        with mock.patch.dict(os.environ, environment, clear=True), contextlib.redirect_stdout(printed):
+            code = call(payload)
+        self.assertEqual(os.listdir(state), [], "a managed pane wrote to the state dir")
+        return code, printed.getvalue()
+
+    def test_failure_in_a_managed_pane_builds_no_runtime(self):
+        """The runtime's paths() creates the accounts dir, so the guard must
+        come before it."""
+        payload = json.dumps({"error": "billing_error"})
+
+        code, _ = self.run_without_runtime(lambda p: grazr.failure(None, p), payload)
+
+        self.assertEqual(code, 0)
+
+    def test_statusline_in_a_managed_pane_only_prints_the_bar(self):
+        code, printed = self.run_without_runtime(
+            lambda p: grazr.statusline(None, p, detach=self.fail), self.payload(used=90)
+        )
+
+        self.assertEqual((code, printed), (0, ""))
+
     def test_a_managed_pane_still_shows_the_bar_configured_before(self):
         with open(os.path.join(self.state_dir, "statusline.previous.json"), "w") as handle:
             json.dump({"previous": {"type": "command", "command": "printf 'inner bar'"},
