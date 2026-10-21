@@ -3604,6 +3604,23 @@ class ConnectTest(EnrolledPairFixture):
         self.assertIn("another grazr", printed)
         self.assertEqual(self.raw_settings(), before)
 
+    def test_enrolling_with_only_another_grazrs_hook_leaves_settings_byte_identical(self):
+        """An empty status line slot and a foreign StopFailure group: enrolling
+        must not install our status line next to their hook, a split owner."""
+        other = os.path.join(self.directory, "other")
+        self.write_settings({"hooks": self.another_grazr(other)["hooks"]})
+        before = self.raw_settings()
+
+        with mock.patch.object(claude, "enrol", lambda *arguments: "uuid-third"), \
+             mock.patch("builtins.input", lambda prompt: "third"):
+            code, printed = self.invoke(lambda runtime: grazr._enrol_from(runtime, None))
+
+        self.assertEqual(code, 0)
+        self.assertIn("Enrolled third as uuid-third", printed)
+        self.assertIn("another grazr (state in %s)" % other, printed)
+        self.assertEqual(self.raw_settings(), before)
+        self.assertFalse(os.path.exists(grazr._record_path(self.state_dir)))
+
     def write_settings(self, settings):
         with open(os.path.join(self.claude_dir, "settings.json"), "w") as handle:
             json.dump(settings, handle)

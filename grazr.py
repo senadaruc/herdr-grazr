@@ -57,6 +57,9 @@ _THRESHOLD_KEYS = {"REMAINING_SESSION": ("session", 15), "REMAINING_WEEKLY": ("w
 _FLAG_KEYS = (("ENABLED", True), ("DRY_RUN", False), ("MODEL_LIMITS", False))
 
 LOG = "grazr.log"
+# Shared by install and enrol, so the wording that refuses a takeover lives once.
+FOREIGN_OWNER_REFUSAL = ("Claude's status line or StopFailure hook already belongs to another grazr "
+                         "(state in %s); disconnect it there, or run install --force to take it over")
 PREVIOUS_STATUSLINE = claude.PREVIOUS_STATUSLINE
 UNREADABLE_PENDING = "statusline.unreadable.json"
 # Only a live session can miss twice, so the armed set never needs to be large.
@@ -1544,7 +1547,7 @@ def install(runtime=None, force=False):
     hook = _failure_command(state_dir)
     other = claude.foreign_owner(paths.config_dir, shim, hook)
     if other and not force:
-        print("grazr: Claude's status line or StopFailure hook already belongs to another grazr (state in %s); disconnect it there, or run install --force to take it over" % other)
+        print("grazr: %s" % (FOREIGN_OWNER_REFUSAL % other))
         return 1
     print(claude.install_statusline(paths.config_dir, _record_path(state_dir), shim, force=force))
     print(claude.install_failure_hook(paths.config_dir, hook, force=force))
@@ -1823,12 +1826,16 @@ def _enrol_from(runtime, source):
     if _unblock(state_dir, identifier, datetime.now(timezone.utc)):
         print("It had failed before, and is back in rotation")
     print('Add it to ACCOUNTS in %s' % _config_path())
-    try:
-        print(claude.install_statusline(paths.config_dir, _record_path(state_dir), _shim_command(state_dir)))
-        print(claude.install_failure_hook(paths.config_dir, _failure_command(state_dir)))
-    except RuntimeError as error:
+    # Checked before either slot is written, so a split between two grazrs never happens.
+    shim = _shim_command(state_dir)
+    hook = _failure_command(state_dir)
+    other = claude.foreign_owner(paths.config_dir, shim, hook)
+    if other:
         # Enrolling worked. The status line or hook is another grazr's to keep.
-        print("grazr: %s" % error)
+        print("grazr: %s" % (FOREIGN_OWNER_REFUSAL % other))
+        return 0
+    print(claude.install_statusline(paths.config_dir, _record_path(state_dir), shim))
+    print(claude.install_failure_hook(paths.config_dir, hook))
     return 0
 
 
