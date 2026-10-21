@@ -2088,6 +2088,19 @@ class HerdrlessPaneTest(unittest.TestCase):
 
         self.assertEqual(self.calls, [])
 
+    def test_nothing_past_the_guard_is_reached_without_a_binary(self):
+        def reached(*arguments, **kwargs):
+            raise AssertionError("reached a Herdr helper without a binary")
+
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+            grazr, "_claude_panes", reached
+        ), mock.patch.object(grazr, "_is_scrolled", reached), mock.patch.object(
+            grazr, "_herdr", reached
+        ):
+            self.assertIsNone(grazr.tag_all("work", spawn=self.spawn))
+            self.assertIsNone(grazr.tag_pane("p1", "work", spawn=self.spawn))
+            self.assertIsNone(grazr._live_panes(spawn=self.spawn))
+
     def test_tag_pane_still_asks_herdr_when_the_binary_is_set(self):
         with mock.patch.dict(os.environ, {"HERDR_BIN_PATH": "/usr/bin/herdr"}):
             grazr.tag_pane("p1", "work", spawn=self.spawn)
@@ -3365,8 +3378,13 @@ class ShimCommandTest(unittest.TestCase):
     environment has none of them."""
 
     def command(self, environment, state_dir="/s"):
-        with mock.patch.dict(os.environ, environment, clear=True):
+        with mock.patch.dict(os.environ, self.isolated(environment), clear=True):
             return grazr._shim_command(state_dir)
+
+    def isolated(self, environment):
+        """Only the given variables, plus the HOME the expected paths expand
+        against, so the result does not depend on the machine's environment."""
+        return dict(environment, HOME=os.path.expanduser("~"))
 
     def script(self):
         return shlex.quote(os.path.abspath(grazr.__file__))
@@ -3406,7 +3424,7 @@ class ShimCommandTest(unittest.TestCase):
         self.assertIn(" GRAZR_NOTIFIER='a b' python3 ", self.command({"GRAZR_NOTIFIER": "a b"}))
 
     def test_the_failure_command_ends_with_failure_and_carries_the_same_prefix(self):
-        environment = {"GRAZR_STATE_DIR": "/s", "GRAZR_NOTIFIER": "queue"}
+        environment = self.isolated({"GRAZR_STATE_DIR": "/s", "GRAZR_NOTIFIER": "queue"})
         with mock.patch.dict(os.environ, environment, clear=True):
             status = grazr._shim_command("/s")
             failure = grazr._failure_command("/s")
