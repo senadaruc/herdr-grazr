@@ -2220,6 +2220,204 @@ class NotifyTest(unittest.TestCase):
         popen.assert_not_called()
 
 
+class NotifierBackendTest(unittest.TestCase):
+    """`GRAZR_NOTIFIER` picks where a notice goes: Herdr's toast, the queue an
+    Orca plugin drains, or a macOS notification. Several may be listed."""
+
+    def setUp(self):
+        self.state_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.state_dir)
+        # The OSC 777 forwarder is a host script; a test must never run it.
+        patcher = mock.patch.object(
+            grazr, "OSC777_SCRIPT", os.path.join(self.state_dir, "no-osc777")
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def environment(self, extra):
+        return mock.patch.dict(
+            os.environ, dict({"GRAZR_STATE_DIR": self.state_dir}, **extra), clear=True
+        )
+
+    def queued(self):
+        try:
+            with open(os.path.join(self.state_dir, "notices.jsonl")) as handle:
+                return handle.read()
+        except FileNotFoundError:
+            return ""
+
+    @staticmethod
+    def no_spawn(argv, **kwargs):
+        raise AssertionError("no process should be spawned: %r" % (argv,))
+
+    def test_unset_or_empty_notifier_is_herdr(self):
+        for extra in ({}, {"GRAZR_NOTIFIER": ""}):
+            with self.subTest(extra=extra):
+                recorded = {}
+
+                def fake_herdr(argv, **kwargs):
+                    recorded["argv"] = argv
+                    return SimpleNamespace(
+                        returncode=0, stdout='{"result":{"shown":true}}', stderr=""
+                    )
+
+                with self.environment(dict(extra, HERDR_BIN_PATH="/usr/bin/herdr")):
+                    self.assertTrue(grazr.notify("t", "b", spawn=fake_herdr))
+                self.assertEqual(recorded["argv"][:3], ["/usr/bin/herdr", "notification", "show"])
+
+    def test_queue_appends_one_json_line_without_spawning(self):
+        with self.environment({"GRAZR_NOTIFIER": "queue"}):
+            self.assertTrue(grazr.notify("Swapped", "now on work", spawn=self.no_spawn))
+
+        lines = self.queued().splitlines()
+        self.assertEqual(len(lines), 1)
+        notice = json.loads(lines[0])
+        self.assertEqual(set(notice), {"ts", "title", "body"})
+        self.assertEqual((notice["title"], notice["body"]), ("Swapped", "now on work"))
+        self.assertIsInstance(notice["ts"], float)
+
+    def test_announce_once_queues_a_notice_and_never_retries_it(self):
+        with self.environment({"GRAZR_NOTIFIER": "queue"}):
+            self.assertTrue(grazr._announce_once(self.state_dir, "k", "t", "b"))
+            self.assertFalse(grazr._announce_once(self.state_dir, "k", "t", "b"))
+
+        self.assertEqual(len(self.queued().splitlines()), 1)
+
+    def test_queue_keeps_only_the_last_200_notices(self):
+        with self.environment({"GRAZR_NOTIFIER": "queue"}):
+            for number in range(205):
+                grazr.notify("n%d" % number, "b", spawn=self.no_spawn)
+
+        notices = [json.loads(line) for line in self.queued().splitlines()]
+        self.assertEqual(len(notices), 200)
+        self.assertEqual(notices[0]["title"], "n5")
+        self.assertEqual(notices[-1]["title"], "n204")
+
+    def test_drain_prints_the_queue_verbatim_and_empties_it(self):
+        with self.environment({"GRAZR_NOTIFIER": "queue"}):
+            for title in ("one", "two", "three"):
+                grazr.notify(title, "b", spawn=self.no_spawn)
+            queued = self.queued()
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                status = grazr.notices_drain()
+
+        self.assertEqual(status, 0)
+        self.assertEqual(out.getvalue(), queued)
+        self.assertEqual(self.queued(), "")
+
+    def test_drain_with_no_queue_prints_nothing(self):
+        out = io.StringIO()
+        with self.environment({}), contextlib.redirect_stdout(out):
+            status = grazr.notices_drain()
+
+        self.assertEqual((status, out.getvalue()), (0, ""))
+
+    def test_drain_is_reached_from_dispatch(self):
+        with mock.patch.object(grazr, "notices_drain", return_value=0) as drain:
+            status = grazr._dispatch(["grazr.py", "notices-drain"])
+
+        drain.assert_called_once_with()
+        self.assertEqual(status, 0)
+
+    def test_drain_takes_the_queue_lock_and_waits_for_it(self):
+        entered = []
+
+        @contextlib.contextmanager
+        def recording_lock(path, wait=False):
+            entered.append((path, wait))
+            yield True
+
+        with self.environment({}), mock.patch.object(grazr, "_file_lock", recording_lock):
+            grazr.notices_drain()
+
+        self.assertEqual(len(entered), 1)
+        path, wait = entered[0]
+        self.assertTrue(path.endswith("notices.queue.lock"), path)
+        self.assertTrue(wait)
+
+    def test_osascript_passes_the_text_as_argv_never_as_script(self):
+        recorded = {}
+        body = 'x" & (do shell script "id") & "'
+
+        def fake_osascript(argv, **kwargs):
+            recorded["argv"] = argv
+            recorded["kwargs"] = kwargs
+            return SimpleNamespace(returncode=0)
+
+        with self.environment({"GRAZR_NOTIFIER": "osascript"}), mock.patch.object(
+            grazr.sys, "platform", "darwin"
+        ):
+            self.assertTrue(grazr.notify("Title", body, spawn=fake_osascript))
+
+        argv = recorded["argv"]
+        self.assertEqual(argv[0], "/usr/bin/osascript")
+        self.assertEqual(argv[-2:], ["Title", body])
+        for element in argv[:-2]:
+            self.assertNotIn(body, element)
+        self.assertEqual(recorded["kwargs"]["timeout"], grazr.NOTIFY_TIMEOUT_SECONDS)
+
+    def test_osascript_reports_its_exit_status(self):
+        for returncode, expected in ((0, True), (1, False)):
+            with self.subTest(returncode=returncode):
+                def fake_osascript(argv, **kwargs):
+                    return SimpleNamespace(returncode=returncode)
+
+                with self.environment({"GRAZR_NOTIFIER": "osascript"}), mock.patch.object(
+                    grazr.sys, "platform", "darwin"
+                ):
+                    self.assertEqual(grazr.notify("t", "b", spawn=fake_osascript), expected)
+
+    def test_osascript_that_cannot_run_is_not_a_success(self):
+        def fake_osascript(argv, **kwargs):
+            raise OSError("no such file")
+
+        with self.environment({"GRAZR_NOTIFIER": "osascript"}), mock.patch.object(
+            grazr.sys, "platform", "darwin"
+        ):
+            self.assertFalse(grazr.notify("t", "b", spawn=fake_osascript))
+
+    def test_osascript_is_skipped_off_macos(self):
+        with self.environment({"GRAZR_NOTIFIER": "osascript"}), mock.patch.object(
+            grazr.sys, "platform", "linux"
+        ):
+            self.assertFalse(grazr.notify("t", "b", spawn=self.no_spawn))
+
+    def test_a_list_fans_out_and_reports_any_success(self):
+        with self.environment({"GRAZR_NOTIFIER": "queue,osascript"}), mock.patch.object(
+            grazr.sys, "platform", "linux"
+        ):
+            self.assertTrue(grazr.notify("t", "b", spawn=self.no_spawn))
+
+        self.assertEqual(len(self.queued().splitlines()), 1)
+
+    def test_whitespace_around_names_is_stripped(self):
+        with self.environment({"GRAZR_NOTIFIER": " bogus , queue "}):
+            self.assertTrue(grazr.notify("t", "b", spawn=self.no_spawn))
+
+        self.assertEqual(len(self.queued().splitlines()), 1)
+
+    def test_none_in_a_list_contributes_nothing(self):
+        with self.environment({"GRAZR_NOTIFIER": "none,osascript"}), mock.patch.object(
+            grazr.sys, "platform", "linux"
+        ):
+            self.assertFalse(grazr.notify("t", "b", spawn=self.no_spawn))
+
+        self.assertEqual(self.queued(), "")
+
+    def test_unknown_name_is_ignored(self):
+        with self.environment({"GRAZR_NOTIFIER": "bogus"}):
+            self.assertFalse(grazr.notify("t", "b", spawn=self.no_spawn))
+
+        self.assertEqual(self.queued(), "")
+
+    def test_none_shows_nothing_even_with_herdr_present(self):
+        with self.environment({"GRAZR_NOTIFIER": "none", "HERDR_BIN_PATH": "/usr/bin/herdr"}):
+            self.assertFalse(grazr.notify("t", "b", spawn=self.no_spawn))
+
+        self.assertEqual(self.queued(), "")
+
+
 class ActOnDecisionTest(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.mkdtemp()

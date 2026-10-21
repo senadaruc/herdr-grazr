@@ -131,7 +131,33 @@ def _forward_osc777(title, body):
         pass
 
 
+# The queue that `notices-drain` empties, and the lock it takes. The queue has
+# its own lock because `_announce_once` holds notices.lock while it notifies.
+NOTICES_QUEUE = "notices.jsonl"
+NOTICES_QUEUE_LOCK = "notices.queue.lock"
+NOTICES_QUEUE_MAX = 200
+
+
 def notify(title, body, spawn=subprocess.run):
+    """Show a notice through every backend GRAZR_NOTIFIER names. Returns
+    whether one of them showed it, which is what `_announce_once` retries on.
+
+    Unset or empty means Herdr's toast alone, which is what grazr always did.
+    """
+    shown = False
+    for backend in _notifiers():
+        shown = _NOTIFIERS[backend](title, body, spawn) or shown
+    return shown
+
+
+def _notifiers():
+    """The backends GRAZR_NOTIFIER names, in order. Unknown names are dropped
+    and `none` is one of them, so a typo silences that backend, never the hook."""
+    names = (os.environ.get("GRAZR_NOTIFIER") or "herdr").split(",")
+    return [name for name in (name.strip() for name in names) if name in _NOTIFIERS]
+
+
+def _notify_herdr(title, body, spawn):
     """Herdr's own toast. Returns whether it was actually shown.
 
     `herdr notification show` exits 0 even when nothing appears: toasts are off
@@ -160,6 +186,53 @@ def notify(title, body, spawn=subprocess.run):
         return json.loads(completed.stdout)["result"]["shown"] is True
     except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired):
         return False
+
+
+def _notify_queue(title, body, spawn):
+    """Queue the notice for `notices-drain`, which the Orca plugin runs every
+    two minutes to show it as an OS notification.
+
+    Always True when the write works: the queue is durable, so `_announce_once`
+    must never retry a notice already in it, or the user would be told twice.
+    The file keeps only its last NOTICES_QUEUE_MAX notices, so an undrained
+    queue cannot grow without bound.
+    """
+    state_dir = _state_dir()
+    path = os.path.join(state_dir, NOTICES_QUEUE)
+    line = json.dumps({"ts": _now_ts(), "title": title, "body": body}) + "\n"
+    try:
+        with _file_lock(os.path.join(state_dir, NOTICES_QUEUE_LOCK), wait=True):
+            with open(path, "a") as handle:
+                handle.write(line)
+            with open(path) as handle:
+                lines = handle.readlines()
+            if len(lines) > NOTICES_QUEUE_MAX:
+                atomic.write(path, "".join(lines[-NOTICES_QUEUE_MAX:]))
+    except OSError:
+        return False
+    return True
+
+
+def _notify_osascript(title, body, spawn):
+    """A macOS notification. The text travels as argv, never inside the
+    AppleScript, so a quote or a `do shell script` in it stays text."""
+    if sys.platform != "darwin":
+        return False
+    try:
+        completed = spawn(
+            ["/usr/bin/osascript", "-e", "on run argv",
+             "-e", "display notification (item 2 of argv) with title (item 1 of argv)",
+             "-e", "end run", title, body],
+            capture_output=True,
+            text=True,
+            timeout=NOTIFY_TIMEOUT_SECONDS,
+        )
+        return completed.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+_NOTIFIERS = {"herdr": _notify_herdr, "queue": _notify_queue, "osascript": _notify_osascript}
 
 
 def tag_all(name, spawn=subprocess.run, pinned=None):
@@ -1480,6 +1553,7 @@ def _dispatch(argv):
         "statusline": statusline, "decide": decide, "install": install, "uninstall": uninstall,
         "status": status, "enrol": enrol, "swap": swap, "tag": tag, "failure": failure,
         "refresh": refresh, "pins-install": pins_install, "pins-uninstall": pins_uninstall,
+        "notices-drain": notices_drain,
     }
     command = argv[1] if len(argv) > 1 else ""
     if command == "install" and len(argv) == 3 and argv[2] == "--force":
@@ -1508,6 +1582,25 @@ def _dispatch(argv):
         ), file=sys.stderr)
         return 2
     return entry_points[command]()
+
+
+def notices_drain(runtime=None):
+    """Print the queued notices and empty the queue, for the Orca plugin to
+    turn into OS notifications. Printing comes before the truncate, so a failed
+    print leaves the notices queued for the next drain instead of losing them.
+    """
+    state_dir = runtime.state_dir if runtime else _state_dir()
+    path = os.path.join(state_dir, NOTICES_QUEUE)
+    with _file_lock(os.path.join(state_dir, NOTICES_QUEUE_LOCK), wait=True):
+        try:
+            with open(path) as handle:
+                queued = handle.read()
+        except OSError:
+            return 0
+        if queued:
+            sys.stdout.write(queued)
+            atomic.write(path, "")
+    return 0
 
 
 def tag(runtime=None):
