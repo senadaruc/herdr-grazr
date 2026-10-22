@@ -39,7 +39,7 @@ Config = namedtuple(
 Runtime = namedtuple("Runtime", "paths store state_dir config")
 
 # Reported by `status --json`.
-VERSION = "0.4.7+fork.7"
+VERSION = "0.4.7+fork.8"
 
 DEFAULT_CONFIG = """\
 # Rotate when a limit group has less than this percent left.
@@ -1850,6 +1850,7 @@ def status_report(runtime, now=None):
                 "id": entry.id,
                 "name": entry.name,
                 "email": _email_of(paths, entry.id),
+                "organization": _organization_of(paths, entry.id),
                 "parked": accounts.has_parked_credential(store, entry.id),
                 "snapshot": accounts.snapshot_to_json(entry.snapshot),
                 "blocked": blocked[entry.id].get("reason") if entry.id in blocked else None,
@@ -1891,6 +1892,14 @@ def _email_of(paths, identifier):
         return None
     email = oauth.get("emailAddress") if isinstance(oauth, dict) else None
     return email if isinstance(email, str) else None
+
+
+def _organization_of(paths, identifier):
+    try:
+        organization = accounts.read(paths, identifier).get("organization")
+    except (OSError, ValueError):
+        return None
+    return organization if isinstance(organization, str) else None
 
 
 def _last_rotation(state_dir):

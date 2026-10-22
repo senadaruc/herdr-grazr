@@ -3155,8 +3155,8 @@ class StatusJsonTest(EnrolledPairFixture):
 
         self.assertEqual([entry["name"] for entry in report["accounts"]], ["personal", "work"])
         self.assertEqual(set(report["accounts"][0]), {
-            "id", "name", "email", "parked", "snapshot", "blocked", "in_order", "first_reading_due",
-            "updated",
+            "id", "name", "email", "organization", "parked", "snapshot", "blocked", "in_order",
+            "first_reading_due", "updated",
         })
         self.assertEqual(report["accounts"][0]["id"], "uuid-personal")
         self.assertIsNone(report["accounts"][0]["snapshot"])
@@ -3191,6 +3191,19 @@ class StatusJsonTest(EnrolledPairFixture):
         self.assertFalse(by_name["personal"]["in_order"])
         self.assertTrue(by_name["work"]["in_order"])
         self.assertEqual(report["order"], ["work"])
+
+    def test_each_account_carries_the_organization_stored_at_enrolment_or_none(self):
+        path = os.path.join(self.state_dir, "accounts", "uuid-personal.json")
+        with open(path) as handle:
+            stored = json.load(handle)
+        stored["organization"] = "Imperum"
+        with open(path, "w") as handle:
+            json.dump(stored, handle)
+
+        by_name = {entry["name"]: entry for entry in self.report()["accounts"]}
+
+        self.assertEqual(by_name["personal"]["organization"], "Imperum")
+        self.assertIsNone(by_name["work"]["organization"])
 
     def test_each_account_carries_its_email_reading_block_and_first_reading_flag(self):
         path = os.path.join(self.state_dir, "accounts", "uuid-personal.json")

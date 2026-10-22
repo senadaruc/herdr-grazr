@@ -4,6 +4,12 @@ Notable changes to *grazr*, newest first. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.4.7+fork.8 - 2026-10-22
+
+### Added
+
+- `status --json` accounts carry `organization`, the organisation name stored at enrolment, or null.
+
 ## 0.4.7+fork.7 - 2026-10-22
 
 ### Added
