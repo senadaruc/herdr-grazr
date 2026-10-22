@@ -3147,6 +3147,9 @@ class StatusJsonTest(EnrolledPairFixture):
         path = os.path.join(self.state_dir, "accounts", report["accounts"][0]["id"] + ".json")
         self.assertAlmostEqual(report["accounts"][0]["updated"], os.path.getmtime(path), places=3)
 
+    def test_updated_at_is_none_for_an_account_with_no_state_file(self):
+        self.assertIsNone(accounts.updated_at(self.runtime().paths, "no-such-id"))
+
     def test_accounts_are_every_enrolled_one_sorted_by_name(self):
         report = self.report()
 
