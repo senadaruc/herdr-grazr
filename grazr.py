@@ -39,7 +39,7 @@ Config = namedtuple(
 Runtime = namedtuple("Runtime", "paths store state_dir config")
 
 # Reported by `status --json`.
-VERSION = "0.4.7+senad.7"
+VERSION = "0.4.7+fork.7"
 
 DEFAULT_CONFIG = """\
 # Rotate when a limit group has less than this percent left.

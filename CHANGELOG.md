@@ -4,7 +4,7 @@ Notable changes to *grazr*, newest first. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## 0.4.7+senad.7 - 2026-10-22
+## 0.4.7+fork.7 - 2026-10-22
 
 ### Added
 
@@ -12,7 +12,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   account's last recorded reading (the state file's mtime), for the Orca
   panel's projection.
 
-## 0.4.7+senad.6 - 2026-10-21
+### Changed
+
+- The fork's version suffix is `+fork.N` instead of `+senad.N`; the numbering continues.
+
+## 0.4.7+fork.6 - 2026-10-21
 
 ### Added
 
@@ -48,7 +52,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   instead of taking it silently, and disconnecting leaves it alone.
 - Without a Herdr binary the pane tags and pane list are skipped outright.
 
-## 0.4.7+senad.5 - 2026-10-19
+## 0.4.7+fork.5 - 2026-10-19
 
 ### Fixed
 
@@ -60,7 +64,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A toast herdr did not show is tried again after a minute, not on every
   message of every pane.
 
-## 0.4.7+senad.4 - 2026-10-18
+## 0.4.7+fork.4 - 2026-10-18
 
 ### Added
 
@@ -68,7 +72,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   another client, checking every name is enrolled. HerdrM uses it to keep
   several hosts on one order.
 
-## 0.4.7+senad.3 - 2026-10-09
+## 0.4.7+fork.3 - 2026-10-09
 
 ### Added
 
@@ -85,7 +89,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   rotation may still move to an account an agent is pinned to. `grazr.py set
   PINNED_ROTATION keep` changes it in place.
 
-## 0.4.7+senad.2 - 2026-10-07
+## 0.4.7+fork.2 - 2026-10-07
 
 ### Added
 
@@ -105,7 +109,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   takes every window the server reports, not only the per-model ones, and lays
   them over the record as they come.
 
-## 0.4.7+senad.1 - 2026-10-06
+## 0.4.7+fork.1 - 2026-10-06
 
 senadaruc's fork of 0.4.7.
 
