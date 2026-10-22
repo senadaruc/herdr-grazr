@@ -3155,7 +3155,7 @@ class StatusJsonTest(EnrolledPairFixture):
 
         self.assertEqual([entry["name"] for entry in report["accounts"]], ["personal", "work"])
         self.assertEqual(set(report["accounts"][0]), {
-            "id", "name", "email", "organization", "parked", "snapshot", "blocked", "in_order",
+            "id", "name", "email", "organization", "plan", "parked", "snapshot", "blocked", "in_order",
             "first_reading_due", "updated",
         })
         self.assertEqual(report["accounts"][0]["id"], "uuid-personal")
@@ -3204,6 +3204,75 @@ class StatusJsonTest(EnrolledPairFixture):
 
         self.assertEqual(by_name["personal"]["organization"], "Imperum")
         self.assertIsNone(by_name["work"]["organization"])
+
+    def set_stored_oauth(self, identifier, oauth):
+        path = os.path.join(self.state_dir, "accounts", identifier + ".json")
+        with open(path) as handle:
+            stored = json.load(handle)
+        stored["oauthAccount"] = dict(stored["oauthAccount"], **oauth)
+        with open(path, "w") as handle:
+            json.dump(stored, handle)
+
+    def write_live_oauth(self, oauth):
+        with open(os.path.join(self.claude_dir, ".claude.json"), "w") as handle:
+            json.dump({"oauthAccount": oauth}, handle)
+
+    def test_a_stored_profile_with_an_organization_type_reports_its_plan(self):
+        self.set_stored_oauth("uuid-personal", {
+            "organizationType": "claude_max",
+            "organizationRateLimitTier": "default_claude_max_20x",
+            "userRateLimitTier": None,
+        })
+
+        by_name = {entry["name"]: entry for entry in self.report()["accounts"]}
+
+        self.assertEqual(by_name["personal"]["plan"], {
+            "type": "claude_max", "tier": "default_claude_max_20x", "seat_tier": None,
+        })
+
+    def test_a_record_without_an_organization_type_has_no_plan(self):
+        by_name = {entry["name"]: entry for entry in self.report()["accounts"]}
+
+        self.assertIsNone(by_name["personal"]["plan"])
+        self.assertIsNone(by_name["work"]["plan"])
+
+    def test_the_live_profile_wins_for_the_active_account_only(self):
+        self.set_stored_oauth("uuid-work", {"organizationType": "claude_max"})
+        self.set_stored_oauth("uuid-personal", {"organizationType": "claude_max"})
+        self.write_live_oauth({
+            "accountUuid": "uuid-work",
+            "organizationType": "claude_team",
+            "userRateLimitTier": "default_claude_max_5x",
+        })
+
+        by_name = {entry["name"]: entry for entry in self.report()["accounts"]}
+
+        self.assertEqual(by_name["work"]["plan"], {
+            "type": "claude_team", "tier": None, "seat_tier": "default_claude_max_5x",
+        })
+        self.assertEqual(by_name["personal"]["plan"]["type"], "claude_max")
+
+    def test_the_active_account_falls_back_to_the_stored_plan_when_live_has_none(self):
+        self.set_stored_oauth("uuid-work", {
+            "organizationType": "claude_max",
+            "organizationRateLimitTier": "default_claude_max_20x",
+        })
+        self.write_live_oauth({"accountUuid": "uuid-work"})
+
+        by_name = {entry["name"]: entry for entry in self.report()["accounts"]}
+
+        self.assertEqual(by_name["work"]["plan"], {
+            "type": "claude_max", "tier": "default_claude_max_20x", "seat_tier": None,
+        })
+
+    def test_an_unreadable_live_config_falls_back_to_the_stored_plan(self):
+        self.set_stored_oauth("uuid-work", {"organizationType": "claude_max"})
+        with open(os.path.join(self.claude_dir, ".claude.json"), "w") as handle:
+            handle.write("{not json")
+
+        by_name = {entry["name"]: entry for entry in self.report()["accounts"]}
+
+        self.assertEqual(by_name["work"]["plan"]["type"], "claude_max")
 
     def test_each_account_carries_its_email_reading_block_and_first_reading_flag(self):
         path = os.path.join(self.state_dir, "accounts", "uuid-personal.json")

@@ -39,7 +39,7 @@ Config = namedtuple(
 Runtime = namedtuple("Runtime", "paths store state_dir config")
 
 # Reported by `status --json`.
-VERSION = "0.4.7+fork.8"
+VERSION = "0.4.7+fork.9"
 
 DEFAULT_CONFIG = """\
 # Rotate when a limit group has less than this percent left.
@@ -1829,6 +1829,7 @@ def status_report(runtime, now=None):
     statusline = claude.statusline_installed(paths.config_dir, _record_path(state_dir), state_dir)
     failure_hook = claude.failure_hook_installed(paths.config_dir, _failure_command(state_dir))
     last = _last_rotation(state_dir)
+    live_oauth = _live_oauth(paths)
     return {
         "installed": statusline and failure_hook,
         "connection": {
@@ -1851,7 +1852,8 @@ def status_report(runtime, now=None):
                 "name": entry.name,
                 "email": _email_of(paths, entry.id),
                 "organization": _organization_of(paths, entry.id),
-                "parked": accounts.has_parked_credential(store, entry.id),
+                "plan": _account_plan(paths, entry.id, active, live_oauth),
+                "parked":accounts.has_parked_credential(store, entry.id),
                 "snapshot": accounts.snapshot_to_json(entry.snapshot),
                 "blocked": blocked[entry.id].get("reason") if entry.id in blocked else None,
                 "in_order": entry.id in ordered_ids,
@@ -1900,6 +1902,42 @@ def _organization_of(paths, identifier):
     except (OSError, ValueError):
         return None
     return organization if isinstance(organization, str) else None
+
+
+def _live_oauth(paths):
+    """The live `oauthAccount` in Claude's config file, None when the file is
+    missing, unreadable or lacks it. Read once per report."""
+    try:
+        with open(paths.config_path) as handle:
+            oauth = json.load(handle).get("oauthAccount")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return oauth if isinstance(oauth, dict) else None
+
+
+def _plan_of(oauth):
+    """The plan Claude's OAuth profile names, or None without an organizationType."""
+    if not isinstance(oauth, dict) or not oauth.get("organizationType"):
+        return None
+    return {
+        "type": oauth["organizationType"],
+        "tier": oauth.get("organizationRateLimitTier"),
+        "seat_tier": oauth.get("userRateLimitTier"),
+    }
+
+
+def _account_plan(paths, identifier, active_id, live_oauth):
+    """The active account's live profile when it names a plan, else the stored
+    record's. Other accounts report the stored record's plan."""
+    if identifier == active_id:
+        live = _plan_of(live_oauth)
+        if live is not None:
+            return live
+    try:
+        oauth = accounts.read(paths, identifier).get("oauthAccount")
+    except (OSError, ValueError):
+        return None
+    return _plan_of(oauth)
 
 
 def _last_rotation(state_dir):
