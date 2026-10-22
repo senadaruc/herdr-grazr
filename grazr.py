@@ -39,7 +39,7 @@ Config = namedtuple(
 Runtime = namedtuple("Runtime", "paths store state_dir config")
 
 # Reported by `status --json`.
-VERSION = "0.4.7+senad.6"
+VERSION = "0.4.7+senad.7"
 
 DEFAULT_CONFIG = """\
 # Rotate when a limit group has less than this percent left.
@@ -1855,6 +1855,7 @@ def status_report(runtime, now=None):
                 "blocked": blocked[entry.id].get("reason") if entry.id in blocked else None,
                 "in_order": entry.id in ordered_ids,
                 "first_reading_due": accounts.first_reading_due(paths, entry.id),
+                "updated": accounts.updated_at(paths, entry.id),
             }
             for entry in everyone
         ],

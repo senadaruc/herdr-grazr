@@ -4,6 +4,14 @@ Notable changes to *grazr*, newest first. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.4.7+senad.7 - 2026-10-22
+
+### Added
+
+- `status --json` account entries carry `updated`, the unix time of the
+  account's last recorded reading (the state file's mtime), for the Orca
+  panel's projection.
+
 ## 0.4.7+senad.6 - 2026-10-21
 
 ### Added

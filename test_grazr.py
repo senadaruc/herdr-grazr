@@ -3139,12 +3139,21 @@ class StatusJsonTest(EnrolledPairFixture):
         self.assertIsNone(report["managed_profile"])
         self.assertFalse(report["installed"])
 
+    def test_each_account_carries_the_reading_time_of_its_state_file(self):
+        report = self.report()
+
+        for entry in report["accounts"]:
+            self.assertIn("updated", entry)
+        path = os.path.join(self.state_dir, "accounts", report["accounts"][0]["id"] + ".json")
+        self.assertAlmostEqual(report["accounts"][0]["updated"], os.path.getmtime(path), places=3)
+
     def test_accounts_are_every_enrolled_one_sorted_by_name(self):
         report = self.report()
 
         self.assertEqual([entry["name"] for entry in report["accounts"]], ["personal", "work"])
         self.assertEqual(set(report["accounts"][0]), {
             "id", "name", "email", "parked", "snapshot", "blocked", "in_order", "first_reading_due",
+            "updated",
         })
         self.assertEqual(report["accounts"][0]["id"], "uuid-personal")
         self.assertIsNone(report["accounts"][0]["snapshot"])

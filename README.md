@@ -303,6 +303,8 @@ driven by the Orca plugin `senadaruc.grazr` instead of Herdr. Orca stays on its
 **System default** account, and *grazr* rotates that login. Orca's own managed
 accounts are never touched. The guard below says how.
 
+`status --json` gives each account an `updated` field: the unix time of its last recorded reading (the mtime of its state file), or `null` when unknown.
+
 Outside Herdr, `GRAZR_STATE_DIR` and `GRAZR_CONFIG_DIR` name the state and
 config directories. They take precedence over `HERDR_PLUGIN_STATE_DIR` and
 `HERDR_PLUGIN_CONFIG_DIR`. The Orca plugin uses `~/.local/state/orca-grazr` and

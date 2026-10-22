@@ -113,6 +113,15 @@ def first_reading_due(paths, identifier):
         return False
 
 
+def updated_at(paths, identifier):
+    """Unix seconds of the account's last recorded reading: the mtime of its
+    state file. None when the file cannot be read."""
+    try:
+        return os.path.getmtime(os.path.join(paths.accounts_dir, identifier + ".json"))
+    except OSError:
+        return None
+
+
 def snapshot_to_json(snapshot):
     if not isinstance(snapshot, list):
         return None
