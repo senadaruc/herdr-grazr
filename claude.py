@@ -372,6 +372,11 @@ def enrol_identity(paths, store, name, identity, blob, expect_email=None):
     `expect_email` is compared case-insensitively: a login under another
     address is refused rather than enrolled under the wrong account."""
     account_id = accounts.account_id(identity.get("accountUuid"))
+    # A non-string e-mail or organisation is stored as None rather than as whatever was sent.
+    identity = dict(identity)
+    for key in ("emailAddress", "organizationName"):
+        if not isinstance(identity.get(key), str):
+            identity[key] = None
 
     if expect_email is not None:
         signed_in = str(identity.get("emailAddress") or "")

@@ -2205,6 +2205,12 @@ def _read_import(text):
     blob = payload.get("blob") if isinstance(payload, dict) else None
     if not isinstance(identity, dict) or not isinstance(blob, str) or not blob:
         raise RuntimeError("The login to import has no identity or credential")
+    try:
+        credential = json.loads(blob)
+    except ValueError:
+        credential = None
+    if not isinstance(credential, dict) or not isinstance(credential.get("claudeAiOauth"), dict):
+        raise RuntimeError("The credential to import is not a Claude login")
     return identity, blob
 
 
@@ -2225,17 +2231,30 @@ def enrol_noninteractive(from_dir=None, stdin=False, name=None, expect_email=Non
         return refuse("this terminal %s" % (MANAGED_NOTICE % home))
     runtime = runtime or _runtime()
     paths, store, state_dir, _ = runtime
+    if from_dir:
+        from_dir = os.path.abspath(from_dir)
     try:
         if stdin:
             identity, blob = _read_import(sys.stdin.read())
-            identifier = claude.enrol_identity(paths, store, name, identity, blob, expect_email)
+            # Same guard as the live login's enrol: a swap must not run between the import and its record.
+            with _rotation_lock(state_dir) as acquired:
+                if not acquired:
+                    raise RuntimeError("Busy rotating, try again in a moment")
+                identifier = claude.enrol_identity(paths, store, name, identity, blob, expect_email)
         else:
             # An isolated login is one no swap touches, so no rotation lock is needed.
             identifier = claude.enrol(paths, store, name, from_dir, expect_email)
     except (RuntimeError, ValueError, OSError) as error:
         return refuse(str(error))
-    email = accounts.read(paths, identifier).get("email")
-    unblocked = _unblock(state_dir, identifier, datetime.now(timezone.utc))
+    # The enrol has happened by now, so nothing after it may turn it into a traceback.
+    try:
+        email = accounts.read(paths, identifier).get("email")
+    except (OSError, ValueError, AttributeError):
+        email = None
+    try:
+        unblocked = _unblock(state_dir, identifier, datetime.now(timezone.utc))
+    except Exception:
+        unblocked = False
     if as_json:
         print(json.dumps({"ok": True, "id": identifier, "name": name, "email": email, "unblocked": unblocked}))
     else:
@@ -2255,7 +2274,7 @@ def login_export(from_dir=None, runtime=None):
         return 1
     runtime = runtime or _runtime()
     try:
-        exported = claude.export_isolated_login(runtime.store, from_dir)
+        exported = claude.export_isolated_login(runtime.store, os.path.abspath(from_dir))
     except (RuntimeError, ValueError, OSError) as error:
         print("grazr: %s" % error, file=sys.stderr)
         return 1
@@ -2271,7 +2290,7 @@ def login_discard(from_dir=None, runtime=None):
         print("grazr: this terminal %s" % (MANAGED_NOTICE % home), file=sys.stderr)
         return 1
     runtime = runtime or _runtime()
-    if claude.discard_isolated_login(runtime.store, from_dir):
+    if claude.discard_isolated_login(runtime.store, os.path.abspath(from_dir)):
         return 0
     print("grazr: could not remove the throwaway login from the keychain", file=sys.stderr)
     return 1

@@ -6457,7 +6457,7 @@ class NonInteractiveEnrolTest(EnrolledPairFixture):
     same credential and account record the menu's enrol does."""
 
     NEW = "44444444-4444-4444-8444-444444444444"
-    BLOB = "SECRET-BLOB-CREDENTIAL"
+    BLOB = json.dumps({"claudeAiOauth": {"accessToken": "SECRET-TOKEN"}})
     MANAGED = "/orca/claude-profiles/abc/home"
 
     def setUp(self):
@@ -6575,6 +6575,11 @@ class NonInteractiveEnrolTest(EnrolledPairFixture):
             "no credential": json.dumps({"identity": self.identity()}),
             "no identity": json.dumps({"blob": self.BLOB}),
             "a bad account id": json.dumps({"identity": {"accountUuid": "../x"}, "blob": self.BLOB}),
+            "a credential that is not JSON": json.dumps({"identity": self.identity(), "blob": "SECRET-TOKEN"}),
+            "a credential that is not an object": json.dumps({"identity": self.identity(), "blob": "[1]"}),
+            "a credential with no claudeAiOauth": json.dumps(
+                {"identity": self.identity(), "blob": json.dumps({"mcpOAuth": {"x": {}}})}
+            ),
         }
         for label, text in cases.items():
             with self.subTest(label), mock.patch("sys.stdin", io.StringIO(text)):
@@ -6625,6 +6630,93 @@ class NonInteractiveEnrolTest(EnrolledPairFixture):
         self.assertEqual(discarded_code, 1)
         self.assertTrue(os.path.isdir(self.isolated))
         self.assertEqual(self.store.parked, {})
+
+    def test_a_failure_after_the_enrol_does_not_turn_it_into_a_traceback(self):
+        """The login is already parked and recorded, so the report stays ok."""
+        with mock.patch.object(grazr, "_unblock", side_effect=OSError("disk gone")):
+            code, printed = self.enrol(from_dir=self.isolated, name="new", as_json=True)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(printed)["ok"], True)
+        self.assertFalse(json.loads(printed)["unblocked"])
+        self.assertEqual(self.store.parked[self.NEW], self.BLOB)
+
+    def test_the_import_takes_the_rotation_lock_and_refuses_when_busy(self):
+        taken = []
+
+        @contextlib.contextmanager
+        def busy(state_dir):
+            taken.append(state_dir)
+            yield False
+
+        exported = json.dumps({"identity": self.identity(), "blob": self.BLOB})
+        with mock.patch.object(grazr, "_rotation_lock", busy), mock.patch("sys.stdin", io.StringIO(exported)):
+            code, printed = self.enrol(stdin=True, name="new", as_json=True)
+
+        self.assertEqual(taken, [self.state_dir])
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(printed)["error"], "Busy rotating, try again in a moment")
+        self.assertEqual(self.store.parked, {})
+
+    def test_the_import_holds_the_lock_while_it_writes(self):
+        held = []
+
+        @contextlib.contextmanager
+        def recording(state_dir):
+            yield True
+            held.append("released")
+
+        exported = json.dumps({"identity": self.identity(), "blob": self.BLOB})
+        real_enrol = claude.enrol_identity
+
+        def write_checking_lock(*args, **kwargs):
+            held.append("written")
+            return real_enrol(*args, **kwargs)
+
+        with mock.patch.object(grazr, "_rotation_lock", recording), mock.patch.object(
+            claude, "enrol_identity", write_checking_lock
+        ), mock.patch("sys.stdin", io.StringIO(exported)):
+            code, _ = self.enrol(stdin=True, name="new", as_json=True)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(held, ["written", "released"])
+
+    def test_a_directory_enrol_takes_no_rotation_lock(self):
+        with mock.patch.object(grazr, "_rotation_lock", side_effect=AssertionError("locked")):
+            code, _ = self.enrol(from_dir=self.isolated, name="new", as_json=True)
+
+        self.assertEqual(code, 0)
+
+    def test_a_relative_directory_reaches_the_store_as_an_absolute_path(self):
+        cwd = os.getcwd()
+        self.addCleanup(os.chdir, cwd)
+        os.chdir(self.directory)
+        seen = []
+        self.store.read_isolated = lambda d: seen.append(d) or self.BLOB
+        self.store.discard_isolated = lambda d: seen.append(d) or True
+
+        self.enrol(from_dir="enrol-tmp", name="new", as_json=True)
+        self.invoke(lambda runtime: grazr.login_export(runtime=runtime, from_dir="enrol-tmp"))
+        self.invoke(lambda runtime: grazr.login_discard(runtime=runtime, from_dir="enrol-tmp"))
+
+        # The cwd is the resolved path on macOS (/private/var), so compare resolved.
+        self.assertEqual(len(seen), 3)
+        for path in seen:
+            self.assertTrue(os.path.isabs(path))
+            self.assertEqual(os.path.realpath(path), os.path.realpath(self.isolated))
+
+    def test_non_string_email_and_organisation_are_stored_as_none(self):
+        with open(os.path.join(self.isolated, ".claude.json"), "w") as handle:
+            json.dump({"oauthAccount": {
+                "accountUuid": self.NEW, "emailAddress": ["x"], "organizationName": 7,
+            }}, handle)
+
+        code, printed = self.enrol(from_dir=self.isolated, name="new", as_json=True)
+
+        self.assertEqual(code, 0)
+        self.assertIsNone(json.loads(printed)["email"])
+        self.assertIsNone(self.record()["email"])
+        self.assertIsNone(self.record()["organization"])
 
     def test_the_flags_must_make_one_whole_request(self):
         good = ["--from", "/d", "--name", "n", "--json"]
