@@ -4,6 +4,12 @@ Notable changes to *grazr*, newest first. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.4.7+fork.11 - 2026-10-31
+
+### Fixed
+
+- A status line without a usable 5-hour window — Ultra's is being removed — no longer drops the weekly reading. Each window is read on its own; a window that is missing, null, `{}`, or lacks a numeric `used_percentage` is left out and the other is kept.
+
 ## 0.4.7+fork.10 - 2026-10-30
 
 ### Added
