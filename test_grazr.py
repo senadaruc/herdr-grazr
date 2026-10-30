@@ -6449,3 +6449,206 @@ class ParkedPollTest(ParkedPollFixture):
         self.assertEqual(sorted(self.asked), ["sk-ant-oat-old", "sk-ant-oat-test"])
         self.assertIn("personal: weekly_all 49% left", printed)
         self.assertEqual(self.refreshed, [])
+
+
+class NonInteractiveEnrolTest(EnrolledPairFixture):
+    """`enrol --from` and `enrol --stdin`, `login-export` and `login-discard`:
+    the sign-in the Orca plugin does without a terminal. Every form writes the
+    same credential and account record the menu's enrol does."""
+
+    NEW = "44444444-4444-4444-8444-444444444444"
+    BLOB = "SECRET-BLOB-CREDENTIAL"
+    MANAGED = "/orca/claude-profiles/abc/home"
+
+    def setUp(self):
+        super().setUp()
+        self.isolated = os.path.join(self.directory, "enrol-tmp")
+        os.makedirs(self.isolated)
+        with open(os.path.join(self.isolated, ".claude.json"), "w") as handle:
+            json.dump({"oauthAccount": self.identity()}, handle)
+        self.store = FakeStore(isolated={self.isolated: self.BLOB}, tokens=self.tokens)
+
+    def identity(self, email="new@imperum.io"):
+        return {"accountUuid": self.NEW, "emailAddress": email, "organizationName": "Imperum"}
+
+    def runtime(self):
+        return super().runtime()._replace(store=self.store)
+
+    def enrol(self, environment=None, **options):
+        return self.invoke(
+            lambda runtime: grazr.enrol_noninteractive(runtime=runtime, **options),
+            **(environment or {})
+        )
+
+    def record_path(self):
+        return os.path.join(self.state_dir, "accounts", self.NEW + ".json")
+
+    def record(self):
+        with open(self.record_path()) as handle:
+            return json.load(handle)
+
+    def test_enrol_from_a_directory_enrols_it_and_reports_json(self):
+        code, printed = self.enrol(from_dir=self.isolated, name="new", as_json=True)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(printed), {
+            "ok": True, "id": self.NEW, "name": "new", "email": "new@imperum.io", "unblocked": False,
+        })
+        self.assertEqual(self.store.parked[self.NEW], self.BLOB)
+        self.assertEqual(self.record()["name"], "new")
+        self.assertNotIn(self.BLOB, printed)
+
+    def test_expect_email_matches_case_insensitively(self):
+        code, printed = self.enrol(from_dir=self.isolated, name="new", expect_email="NEW@Imperum.IO", as_json=True)
+
+        self.assertEqual(code, 0)
+        self.assertTrue(json.loads(printed)["ok"])
+
+    def test_a_login_under_another_address_is_refused_and_nothing_is_written(self):
+        code, printed = self.enrol(from_dir=self.isolated, name="new", expect_email="other@imperum.io", as_json=True)
+
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(printed), {
+            "ok": False, "error": "signed in as new@imperum.io, expected other@imperum.io",
+        })
+        self.assertEqual(self.store.parked, {})
+        self.assertFalse(os.path.exists(self.record_path()))
+
+    def test_the_same_refusal_holds_for_an_import(self):
+        exported = json.dumps({"identity": self.identity(), "blob": self.BLOB})
+        with mock.patch("sys.stdin", io.StringIO(exported)):
+            code, printed = self.enrol(stdin=True, name="new", expect_email="other@imperum.io", as_json=True)
+
+        self.assertEqual(code, 1)
+        self.assertFalse(json.loads(printed)["ok"])
+        self.assertEqual(self.store.parked, {})
+        self.assertFalse(os.path.exists(self.record_path()))
+
+    def test_a_duplicate_name_is_refused_as_json(self):
+        code, printed = self.enrol(from_dir=self.isolated, name="work", as_json=True)
+
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(printed)["error"], "The name 'work' is already used by another account")
+        self.assertEqual(self.store.parked, {})
+
+    def test_without_json_a_refusal_is_a_line_on_screen(self):
+        code, printed = self.enrol(from_dir=self.isolated, name="new", expect_email="other@imperum.io")
+
+        self.assertEqual(code, 1)
+        self.assertEqual(printed, "grazr: signed in as new@imperum.io, expected other@imperum.io\n")
+
+    def test_export_prints_one_json_line_and_nothing_else(self):
+        code, printed = self.invoke(lambda runtime: grazr.login_export(runtime=runtime, from_dir=self.isolated))
+
+        self.assertEqual(code, 0)
+        self.assertEqual(printed.count("\n"), 1)
+        self.assertEqual(json.loads(printed), {"identity": self.identity(), "blob": self.BLOB})
+
+    def test_export_without_a_login_fails_on_stderr_with_nothing_on_stdout(self):
+        self.store.isolated = {}
+        errors = io.StringIO()
+
+        with contextlib.redirect_stderr(errors):
+            code, printed = self.invoke(lambda runtime: grazr.login_export(runtime=runtime, from_dir=self.isolated))
+
+        self.assertEqual((code, printed), (1, ""))
+        self.assertIn("No login found", errors.getvalue())
+        self.assertNotIn(self.BLOB, errors.getvalue())
+
+    def test_an_import_writes_the_same_credential_and_record_as_a_directory_enrol(self):
+        self.enrol(from_dir=self.isolated, name="new", as_json=True)
+        from_directory = (self.store.parked[self.NEW], self.record())
+        self.store.parked.clear()
+        os.remove(self.record_path())
+        _, exported = self.invoke(lambda runtime: grazr.login_export(runtime=runtime, from_dir=self.isolated))
+
+        with mock.patch("sys.stdin", io.StringIO(exported)):
+            code, printed = self.enrol(stdin=True, name="new", as_json=True)
+
+        self.assertEqual(code, 0)
+        self.assertTrue(json.loads(printed)["ok"])
+        self.assertEqual((self.store.parked[self.NEW], self.record()), from_directory)
+
+    def test_an_import_that_is_not_the_export_format_is_refused_without_echoing_it(self):
+        cases = {
+            "not JSON": "not json " + self.BLOB,
+            "no credential": json.dumps({"identity": self.identity()}),
+            "no identity": json.dumps({"blob": self.BLOB}),
+            "a bad account id": json.dumps({"identity": {"accountUuid": "../x"}, "blob": self.BLOB}),
+        }
+        for label, text in cases.items():
+            with self.subTest(label), mock.patch("sys.stdin", io.StringIO(text)):
+                code, printed = self.enrol(stdin=True, name="new", as_json=True)
+
+                self.assertEqual(code, 1)
+                self.assertFalse(json.loads(printed)["ok"])
+                self.assertNotIn(self.BLOB, printed)
+        self.assertEqual(self.store.parked, {})
+
+    def test_enrolling_lifts_a_block_on_the_account(self):
+        now = datetime.now(timezone.utc)
+        grazr._block(self.state_dir, self.NEW, "billing_error", [], now)
+
+        code, printed = self.enrol(from_dir=self.isolated, name="new", as_json=True)
+
+        self.assertEqual(code, 0)
+        self.assertTrue(json.loads(printed)["unblocked"])
+        self.assertNotIn(self.NEW, grazr._read_blocked(self.state_dir, now))
+
+    def test_discard_removes_the_isolated_login_and_its_directory(self):
+        code, printed = self.invoke(lambda runtime: grazr.login_discard(runtime=runtime, from_dir=self.isolated))
+
+        self.assertEqual((code, printed), (0, ""))
+        self.assertNotIn(self.isolated, self.store.isolated)
+        self.assertFalse(os.path.exists(self.isolated))
+
+    def test_discard_with_nothing_there_still_exits_zero(self):
+        code, _ = self.invoke(
+            lambda runtime: grazr.login_discard(runtime=runtime, from_dir=os.path.join(self.directory, "never"))
+        )
+
+        self.assertEqual(code, 0)
+
+    def test_the_new_forms_refuse_an_orca_managed_profile(self):
+        environment = {"ORCA_CLAUDE_INJECTED_CONFIG_DIR": self.MANAGED}
+
+        code, printed = self.enrol(environment, from_dir=self.isolated, name="new", as_json=True)
+        self.assertEqual(code, 1)
+        self.assertIn("Orca-managed", json.loads(printed)["error"])
+        exported_code, exported = self.invoke(
+            lambda runtime: grazr.login_export(runtime=runtime, from_dir=self.isolated), **environment
+        )
+        self.assertEqual((exported_code, exported), (1, ""))
+        discarded_code, _ = self.invoke(
+            lambda runtime: grazr.login_discard(runtime=runtime, from_dir=self.isolated), **environment
+        )
+        self.assertEqual(discarded_code, 1)
+        self.assertTrue(os.path.isdir(self.isolated))
+        self.assertEqual(self.store.parked, {})
+
+    def test_the_flags_must_make_one_whole_request(self):
+        good = ["--from", "/d", "--name", "n", "--json"]
+        self.assertEqual(grazr._enrol_flags(good)["from_dir"], "/d")
+        self.assertTrue(grazr._enrol_flags(["--stdin", "--name", "n"])["stdin"])
+        for bad in (
+            ["--name", "n"],
+            ["--from", "/d"],
+            ["--from", "/d", "--stdin", "--name", "n"],
+            ["--from", "/d", "--name", "n", "--name", "m"],
+            ["--from", "/d", "--name", "n", "--json", "--json"],
+            ["--from", "/d", "--name", "n", "--expect-email", ""],
+            ["--from", "/d", "--name", ""],
+            ["--from", "/d", "--name", "n", "--bogus"],
+            ["--from", "/d", "--name"],
+        ):
+            with self.subTest(bad=bad):
+                self.assertIsNone(grazr._enrol_flags(bad))
+
+    def test_a_malformed_enrol_is_a_usage_error_before_anything_runs(self):
+        errors = io.StringIO()
+
+        with contextlib.redirect_stderr(errors):
+            code = grazr._dispatch(["grazr.py", "enrol", "--from"])
+
+        self.assertEqual(code, 2)
+        self.assertIn("usage: grazr.py enrol", errors.getvalue())

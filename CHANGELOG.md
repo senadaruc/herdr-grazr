@@ -4,6 +4,15 @@ Notable changes to *grazr*, newest first. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.4.7+fork.10 - 2026-10-30
+
+### Added
+
+- `enrol --from DIR --name NAME [--expect-email EMAIL] [--json]` enrols an isolated login with no prompts. `--json` prints `{"ok", "id", "name", "email", "unblocked"}` or `{"ok": false, "error"}` and exits 1 on refusal. A login signed in under another address than `--expect-email` is refused and nothing is written.
+- `login-export --from DIR` prints one JSON line `{"identity", "blob"}` for another engine's import, and nothing else on stdout.
+- `enrol --stdin --name NAME [--expect-email EMAIL] [--json]` enrols a login read from that JSON, writing the same credential and record as `enrol --from`.
+- `login-discard --from DIR` removes a throwaway isolated login and its config dir.
+
 ## 0.4.7+fork.9 - 2026-10-22
 
 ### Added

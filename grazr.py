@@ -39,7 +39,7 @@ Config = namedtuple(
 Runtime = namedtuple("Runtime", "paths store state_dir config")
 
 # Reported by `status --json`.
-VERSION = "0.4.7+fork.9"
+VERSION = "0.4.7+fork.10"
 
 DEFAULT_CONFIG = """\
 # Rotate when a limit group has less than this percent left.
@@ -1604,6 +1604,17 @@ def _dispatch(argv):
     if command == "status" and len(argv) > 2 and all(flag in status_flags for flag in argv[2:]):
         # The Orca plugin reads the report as JSON, and never waits on a key.
         return status(**dict(status_flags[flag] for flag in argv[2:]))
+    if command == "enrol" and len(argv) > 2:
+        # Without a terminal: the Orca plugin signs in, then enrols the result here.
+        options = _enrol_flags(argv[2:])
+        if options is None:
+            print(ENROL_USAGE, file=sys.stderr)
+            return 2
+        return enrol_noninteractive(**options)
+    if command == "login-export" and len(argv) == 4 and argv[2] == "--from":
+        return login_export(from_dir=argv[3])
+    if command == "login-discard" and len(argv) == 4 and argv[2] == "--from":
+        return login_discard(from_dir=argv[3])
     if command == "recover" and len(argv) == 4:
         # Detached from the failure hook, with the error and the account it hit.
         return recover(error=argv[2], failed=argv[3])
@@ -1614,7 +1625,9 @@ def _dispatch(argv):
             or (command == "status" and len(argv) > 2)):
         print("usage: grazr.py %s" % "|".join(
             list(entry_points) + ["install --force", "pin PANE ACCOUNT", "unpin PANE", "token ACCOUNT",
-                                  "token-forget ACCOUNT", "set ACCOUNTS|PINNED_ROTATION|ENABLED VALUE"]
+                                  "token-forget ACCOUNT", "set ACCOUNTS|PINNED_ROTATION|ENABLED VALUE",
+                                  "enrol --from DIR|--stdin --name NAME [--expect-email EMAIL] [--json]",
+                                  "login-export --from DIR", "login-discard --from DIR"]
         ), file=sys.stderr)
         return 2
     return entry_points[command]()
@@ -2146,6 +2159,122 @@ def _enrol_between_rotations(runtime, name, source):
             raise RuntimeError("Busy rotating, try again in a moment")
         return claude.enrol(runtime.paths, runtime.store, name, source)
 
+
+
+ENROL_USAGE = "usage: grazr.py enrol (--from DIR | --stdin) --name NAME [--expect-email EMAIL] [--json]"
+_ENROL_VALUE_FLAGS = {"--from": "from_dir", "--name": "name", "--expect-email": "expect_email"}
+_ENROL_SWITCHES = {"--stdin": "stdin", "--json": "as_json"}
+
+
+def _enrol_flags(arguments):
+    """The flags of a non-interactive `enrol`. None unless they make one whole
+    request: each flag once, a non-empty name, and exactly one login source.
+    An empty --expect-email is refused here, since it would check nothing."""
+    options = {"from_dir": None, "name": None, "expect_email": None, "stdin": False, "as_json": False}
+    seen = set()
+    index = 0
+    while index < len(arguments):
+        flag = arguments[index]
+        if flag in seen:
+            return None
+        if flag in _ENROL_SWITCHES:
+            options[_ENROL_SWITCHES[flag]] = True
+        elif flag in _ENROL_VALUE_FLAGS and index + 1 < len(arguments):
+            value = arguments[index + 1].strip()
+            if not value:
+                return None
+            options[_ENROL_VALUE_FLAGS[flag]] = value
+            index += 1
+        else:
+            return None
+        seen.add(flag)
+        index += 1
+    if not options["name"] or bool(options["from_dir"]) == options["stdin"]:
+        return None
+    return options
+
+
+def _read_import(text):
+    """The JSON that `login-export` printed, as read from stdin. A refusal says
+    what is missing, never what was there: the text holds a credential."""
+    try:
+        payload = json.loads(text)
+    except ValueError:
+        raise RuntimeError("The login to import is not JSON")
+    identity = payload.get("identity") if isinstance(payload, dict) else None
+    blob = payload.get("blob") if isinstance(payload, dict) else None
+    if not isinstance(identity, dict) or not isinstance(blob, str) or not blob:
+        raise RuntimeError("The login to import has no identity or credential")
+    return identity, blob
+
+
+def enrol_noninteractive(from_dir=None, stdin=False, name=None, expect_email=None, as_json=False, runtime=None):
+    """`enrol` with its answers as flags, so the Orca plugin can enrol a login
+    it signed in without a terminal. Same enrolment as the menu, without the
+    prompts; the install side of _enrol_from is not repeated here."""
+
+    def refuse(message):
+        if as_json:
+            print(json.dumps({"ok": False, "error": message}))
+        else:
+            print("grazr: %s" % message)
+        return 1
+
+    home = managed_claude_home()
+    if home:
+        return refuse("this terminal %s" % (MANAGED_NOTICE % home))
+    runtime = runtime or _runtime()
+    paths, store, state_dir, _ = runtime
+    try:
+        if stdin:
+            identity, blob = _read_import(sys.stdin.read())
+            identifier = claude.enrol_identity(paths, store, name, identity, blob, expect_email)
+        else:
+            # An isolated login is one no swap touches, so no rotation lock is needed.
+            identifier = claude.enrol(paths, store, name, from_dir, expect_email)
+    except (RuntimeError, ValueError, OSError) as error:
+        return refuse(str(error))
+    email = accounts.read(paths, identifier).get("email")
+    unblocked = _unblock(state_dir, identifier, datetime.now(timezone.utc))
+    if as_json:
+        print(json.dumps({"ok": True, "id": identifier, "name": name, "email": email, "unblocked": unblocked}))
+    else:
+        print("Enrolled %s as %s" % (name, identifier))
+        if unblocked:
+            print("It had failed before, and is back in rotation")
+    return 0
+
+
+def login_export(from_dir=None, runtime=None):
+    """Print an isolated login as one JSON line, for the plugin to pipe into
+    `enrol --stdin` on another host. That line is the only output: the
+    credential goes to stdout and nowhere else."""
+    home = managed_claude_home()
+    if home:
+        print("grazr: this terminal %s" % (MANAGED_NOTICE % home), file=sys.stderr)
+        return 1
+    runtime = runtime or _runtime()
+    try:
+        exported = claude.export_isolated_login(runtime.store, from_dir)
+    except (RuntimeError, ValueError, OSError) as error:
+        print("grazr: %s" % error, file=sys.stderr)
+        return 1
+    print(json.dumps(exported))
+    return 0
+
+
+def login_discard(from_dir=None, runtime=None):
+    """Remove a throwaway login and its config dir. Exit 0 when nothing was
+    there, since that is the state the caller wanted."""
+    home = managed_claude_home()
+    if home:
+        print("grazr: this terminal %s" % (MANAGED_NOTICE % home), file=sys.stderr)
+        return 1
+    runtime = runtime or _runtime()
+    if claude.discard_isolated_login(runtime.store, from_dir):
+        return 0
+    print("grazr: could not remove the throwaway login from the keychain", file=sys.stderr)
+    return 1
 
 
 # Pinning an agent to an account. See pins.py.

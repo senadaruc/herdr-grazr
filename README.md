@@ -303,6 +303,8 @@ driven by the Orca plugin `senadaruc.grazr` instead of Herdr. Orca stays on its
 **System default** account, and *grazr* rotates that login. Orca's own managed
 accounts are never touched. The guard below says how.
 
+Sign-in without a terminal (used by the Orca plugin) runs on the same engine: `enrol --from DIR --name NAME [--expect-email EMAIL] --json` enrols an isolated login directory, `login-export --from DIR` prints that login as one JSON line, `enrol --stdin --name NAME ... --json` enrols such a line on another host, and `login-discard --from DIR` removes the throwaway login. Each refuses a managed Orca profile, as `enrol` does.
+
 `status --json` gives each account an `updated` field: the unix time of its last recorded reading (the mtime of its state file), or `null` when unknown.
 
 Outside Herdr, `GRAZR_STATE_DIR` and `GRAZR_CONFIG_DIR` name the state and
