@@ -8,7 +8,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- Ultra accounts rotate on the weekly limit only (ULTRA_NO_SESSION=1, default); a real limit refusal still swaps through the failure hook.
+- Ultra accounts rotate on the weekly limit only (ULTRA_NO_SESSION=1, default); a real limit refusal still swaps through the failure hook. Where Anthropic has not removed an Ultra account's 5-hour limit yet, that account still hits it before rotating, and the failure hook then swaps; `ULTRA_NO_SESSION=0` turns the rule off.
 
 ## 0.4.7+fork.11 - 2026-10-31
 

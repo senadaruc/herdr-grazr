@@ -40,6 +40,7 @@ NOW = datetime(2026, 9, 4, 12, 0, tzinfo=timezone.utc)
 LATER = datetime(2026, 9, 4, 17, 0, tzinfo=timezone.utc)
 EARLIER = datetime(2026, 9, 4, 7, 0, tzinfo=timezone.utc)
 SOONER = datetime(2026, 9, 4, 14, 0, tzinfo=timezone.utc)
+LATEST = datetime(2026, 9, 4, 18, 0, tzinfo=timezone.utc)
 THRESHOLDS = {"session": 15, "weekly": 20}
 
 
@@ -2540,6 +2541,19 @@ class ActOnDecisionTest(unittest.TestCase):
                 now or NOW,
             )
 
+    def test_the_exhausted_notice_skips_an_ultra_accounts_session_window(self):
+        """The active Ultra account is free only once its last spent window
+        resets. Its session window ends later, but that one no longer counts,
+        so the notice must quote the earlier weekly reset."""
+        limits = [limit(group="session", remaining=0, resets_at=LATER), limit(group="weekly", remaining=5, resets_at=SOONER)]
+        active = Account("uuid-work", "work", None, ULTRA)
+        other = account_named("personal", "uuid-personal", [limit(group="weekly", remaining=5, resets_at=LATEST)])
+
+        line = self.act("exhausted", limits=limits, accounts=[active, other])
+
+        self.assertIn(clock(SOONER), line)
+        self.assertNotIn(clock(LATER), line)
+
     def test_the_line_names_the_window_that_triggered_the_swap(self):
         limits = [limit(group="session", remaining=40), limit(group="weekly", remaining=19)]
 
@@ -2932,6 +2946,50 @@ class SwapTest(EnrolledPairFixture):
 
         with open(os.path.join(self.state_dir, "grazr.log")) as handle:
             self.assertIn("Rotated work -> personal", handle.read())
+
+    def write_snapshot(self, identifier, windows):
+        path = os.path.join(self.state_dir, "accounts", identifier + ".json")
+        with open(path) as handle:
+            stored = json.load(handle)
+        stored["snapshot"] = [{
+            "kind": group, "scope": None, "group": group, "remaining": remaining,
+            "resets_at": resets_at.isoformat(),
+        } for group, remaining, resets_at in windows]
+        with open(path, "w") as handle:
+            json.dump(stored, handle)
+
+    def set_ultra(self, identifier):
+        path = os.path.join(self.state_dir, "accounts", identifier + ".json")
+        with open(path) as handle:
+            stored = json.load(handle)
+        stored["oauthAccount"] = dict(stored["oauthAccount"], organizationType="claude_max",
+                                      organizationRateLimitTier="default_claude_max_20x")
+        with open(path, "w") as handle:
+            json.dump(stored, handle)
+
+    @property
+    def later(self):
+        """A reset still ahead of the clock: the fixed LATER is long past."""
+        return datetime.now(timezone.utc) + timedelta(hours=3)
+
+    def test_a_swap_takes_a_parked_ultra_account_with_a_spent_session_and_weekly_room(self):
+        self.set_ultra("uuid-personal")
+        self.write_snapshot("uuid-personal", [("session", 0, self.later), ("weekly", 80, self.later)])
+
+        code, printed = self.invoke(grazr.swap)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(self.rotations[0][2:4], ("uuid-work", "uuid-personal"))
+
+    def test_the_same_parked_account_is_refused_with_the_flag_off(self):
+        self.set_ultra("uuid-personal")
+        self.write_snapshot("uuid-personal", [("session", 0, self.later), ("weekly", 80, self.later)])
+        self.write_config('ACCOUNTS="work personal"\nULTRA_NO_SESSION=0\n')
+
+        code, printed = self.invoke(grazr.swap)
+
+        self.assertEqual(self.rotations, [])
+        self.assertIn("Nothing to swap to", printed)
 
     def test_honours_dry_run(self):
         self.write_config('ACCOUNTS="work personal"\nDRY_RUN=1\n')
@@ -6552,6 +6610,33 @@ class UltraStatuslineTest(EnrolledPairFixture):
         self.run_statusline(self.payload(session_used=10, weekly_used=95))
 
         self.assertEqual(self.rotations[0][2:4], ("uuid-work", "uuid-personal"))
+
+    def test_a_garbled_live_profile_still_prints_the_bar_and_uses_the_stored_plan(self):
+        self.set_plan("uuid-work", ULTRA)
+        with open(os.path.join(self.claude_dir, ".claude.json"), "w") as handle:
+            handle.write("{not json")
+        with open(os.path.join(self.state_dir, grazr.PREVIOUS_STATUSLINE), "w") as handle:
+            json.dump({"previous": {"command": "my-bar --compact"}}, handle)
+        spawn = lambda command, **keywords: SimpleNamespace(returncode=0, stdout="BAR ")
+
+        code, printed = self.invoke(
+            lambda runtime: grazr.statusline(
+                runtime, self.payload(session_used=95, weekly_used=20), spawn=spawn,
+                detach=lambda: grazr.decide(runtime),
+            )
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(printed, "BAR ")
+        self.assertEqual(self.rotations, [])
+
+    def test_with_the_flag_off_the_live_profile_is_never_read(self):
+        self.write_config('ACCOUNTS="work personal"\nULTRA_NO_SESSION=0\n')
+
+        with mock.patch.object(grazr, "_live_oauth", wraps=grazr._live_oauth) as live:
+            self.run_statusline(self.payload(session_used=95, weekly_used=20))
+
+        self.assertEqual(live.call_count, 0)
 
     def test_the_status_report_marks_ultra_accounts_and_the_setting(self):
         self.set_plan("uuid-work", ULTRA)

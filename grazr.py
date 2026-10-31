@@ -359,6 +359,10 @@ def act_on(decision, runtime, active_id, limits, enrolled=(), now=None, why=None
     dry_run = config.dry_run
     if decision == "stay":
         return None
+    # What the active account's reading says once Ultra's session window is
+    # set aside, so the notices quote the window that really decides.
+    active_record = next((entry for entry in enrolled if entry.id == active_id), None)
+    judged = _decision_limits(active_record, limits, config) if active_record else limits
 
     def name_of(identifier):
         return _name_of(enrolled, identifier)
@@ -375,7 +379,7 @@ def act_on(decision, runtime, active_id, limits, enrolled=(), now=None, why=None
         # serve requests, so saying they are spent would stop you working for
         # no reason.
         readings = {entry.id: entry.snapshot for entry in enrolled}
-        readings[active_id] = limits
+        readings[active_id] = judged
         line = "Every account is below your thresholds, earliest reset %s" % _earliest_reset(
             now or datetime.now(timezone.utc), config.thresholds, readings, enrolled
         )
@@ -404,8 +408,6 @@ def act_on(decision, runtime, active_id, limits, enrolled=(), now=None, why=None
     now = now or datetime.now(timezone.utc)
     _record_arrival(state_dir, next_id, now)
     if why is None:
-        active_record = next((entry for entry in enrolled if entry.id == active_id), None)
-        judged = _decision_limits(active_record, limits, config) if active_record else limits
         low = core.shortfall(judged or [], now, config.thresholds)
         if low:
             why = ", %s %d%% < %d%%" % (low.group, low.remaining, config.thresholds[low.group])
@@ -847,7 +849,9 @@ def _decision_setup(paths, enrolled, active, config):
     their session windows dropped where `_decision_limits` says so. The active
     account's plan comes from Claude's live profile when that names one, since
     it is the account in use. Returns (active record, accounts)."""
-    live = accounts.plan_of(_live_oauth(paths))
+    # Only an Ultra rule reads the plan, and the live profile is read only when
+    # it can change the answer: with the flag off, the stored plans stand.
+    live = accounts.plan_of(_live_oauth(paths)) if config.ultra_no_session else None
     views = []
     for entry in enrolled:
         record = entry._replace(plan=live if entry.id == active and live is not None else entry.plan)
@@ -1811,7 +1815,7 @@ def swap(runtime=None, target=None):
             return _refuse_swap("Not logged in, nothing to swap from")
         limits = _latest_reading(paths, active)
         if target is not None:
-            enrolled = accounts.load(paths, [])
+            _, enrolled = _decision_setup(paths, accounts.load(paths, []), active, config)
             next_id = next(
                 (entry.id for entry in enrolled if target in (entry.name, entry.id)), None
             )
@@ -1832,9 +1836,13 @@ def swap(runtime=None, target=None):
                     % _name_of(enrolled, next_id)
                 )
         else:
-            enrolled = _bound(
-                _usable(state_dir, accounts.load(paths, config.accounts), active, now, config),
-                _models_in_use(state_dir, now),
+            _, enrolled = _decision_setup(
+                paths,
+                _bound(
+                    _usable(state_dir, accounts.load(paths, config.accounts), active, now, config),
+                    _models_in_use(state_dir, now),
+                ),
+                active, config,
             )
             next_id = core.next_account(active, enrolled, now, config.thresholds)
         if next_id is None:

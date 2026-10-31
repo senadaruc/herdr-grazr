@@ -218,6 +218,12 @@ window. If Claude refuses a request anyway, the failure hook swaps as before.
 `ULTRA_NO_SESSION=0` puts the 5-hour window back into the decision for Ultra
 accounts too.
 
+The rule follows the plan, not the server. Where Anthropic has not removed an
+Ultra account's 5-hour limit yet, that account still hits it before *grazr*
+rotates, and the failure hook then swaps the pane on the refusal, as it does
+for any account. Turn the rule off with `ULTRA_NO_SESSION=0` for such accounts
+if you would rather rotate on the 5-hour window too.
+
 ## Parked accounts
 
 *grazr* reads an account's usage only from the status line of the account in
