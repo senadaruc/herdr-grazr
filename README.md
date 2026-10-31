@@ -122,6 +122,7 @@ ENABLED=1
 DRY_RUN=0                # 1 = log the decision, do not swap
 MODEL_LIMITS=0           # 1 = also watch per-model weekly limits (see below)
 PARKED_POLL_MINUTES=0    # re-read parked accounts this often (see below)
+ULTRA_NO_SESSION=1       # 1 = Ultra accounts rotate on the weekly limit only (see below)
 ```
 
 *grazr* never moves back to an account just because it recovered. The one
@@ -202,6 +203,20 @@ finding per-model readings. And *grazr* learns an account's per-model headroom
 only while that account is live. It never refreshes a parked token to ask, so
 a swap can land on an account that is also out of that model, and *grazr*
 moves on after the next reading.
+
+### Ultra accounts
+
+Anthropic is renaming Max 20x to Ultra and removing its 5-hour window, in
+stages, once an account is verified. The weekly limit stays. With
+`ULTRA_NO_SESSION=1`, the default, *grazr* drops the 5-hour window from the
+decision for any account whose plan is Ultra (a `max_20x` tier, or a plan
+named `ultra`), so such an account at 5% of its 5-hour window stays put while
+its week has room, and a parked Ultra account with a spent 5-hour window but
+weekly headroom is still a valid place to go. Accounts on other plans are
+unchanged, and the stored readings and the status screen still show the 5-hour
+window. If Claude refuses a request anyway, the failure hook swaps as before.
+`ULTRA_NO_SESSION=0` puts the 5-hour window back into the decision for Ultra
+accounts too.
 
 ## Parked accounts
 

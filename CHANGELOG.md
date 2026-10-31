@@ -4,6 +4,12 @@ Notable changes to *grazr*, newest first. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.4.7+fork.12 - 2026-10-31
+
+### Changed
+
+- Ultra accounts rotate on the weekly limit only (ULTRA_NO_SESSION=1, default); a real limit refusal still swaps through the failure hook.
+
 ## 0.4.7+fork.11 - 2026-10-31
 
 ### Fixed

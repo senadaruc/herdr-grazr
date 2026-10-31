@@ -1,7 +1,8 @@
 from collections import namedtuple
 
 Limit = namedtuple("Limit", "kind scope group remaining resets_at")
-Account = namedtuple("Account", "id name snapshot")
+# plan is the account's plan as accounts.plan_of reads it, None when unknown.
+Account = namedtuple("Account", "id name snapshot plan", defaults=(None,))
 
 # Once every account is below the thresholds, another one must be this much
 # better off before it is worth a swap, or two low accounts would trade places
@@ -13,6 +14,18 @@ FRESH = 95
 
 # How long before its reset an account's leftover is worth going back for.
 LAST_DAY_SECONDS = 24 * 60 * 60
+
+
+def is_ultra(plan):
+    """Whether a plan is Ultra, the new name for Max 20x. Its 5-hour window is
+    being removed, so it is judged on the weekly window alone. A plan that is
+    missing or unreadable is not Ultra."""
+    if not isinstance(plan, dict):
+        return False
+    text = {key: value.lower() for key, value in plan.items() if isinstance(value, str)}
+    if any(text.get(key, "").endswith("max_20x") for key in ("tier", "seat_tier")):
+        return True
+    return any("ultra" in text.get(key, "") for key in ("type", "tier", "seat_tier"))
 
 
 def merged(previous, current, now):

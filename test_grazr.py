@@ -3130,7 +3130,7 @@ class StatusJsonTest(EnrolledPairFixture):
         self.assertEqual(set(report["connection"]["foreign"]), {"statusline", "failure_hook"})
         self.assertEqual(set(report["settings"]), {
             "thresholds", "enabled", "dry_run", "model_limits", "parked_poll_minutes",
-            "pinned_rotation", "config_path", "state_dir", "notifier",
+            "pinned_rotation", "ultra_no_session", "config_path", "state_dir", "notifier",
         })
         self.assertEqual(report["settings"]["thresholds"], {"session": 15, "weekly": 10})
         self.assertEqual(report["settings"]["state_dir"], self.state_dir)
@@ -3155,7 +3155,7 @@ class StatusJsonTest(EnrolledPairFixture):
 
         self.assertEqual([entry["name"] for entry in report["accounts"]], ["personal", "work"])
         self.assertEqual(set(report["accounts"][0]), {
-            "id", "name", "email", "organization", "plan", "parked", "snapshot", "blocked", "in_order",
+            "id", "name", "email", "organization", "plan", "ultra", "parked", "snapshot", "blocked", "in_order",
             "first_reading_due", "updated",
         })
         self.assertEqual(report["accounts"][0]["id"], "uuid-personal")
@@ -6293,6 +6293,280 @@ class TokenStoreTest(unittest.TestCase):
         self.assertIn("-s grazr-token-uuid-a -a me", written)
         self.assertNotIn("sk-ant-oat01-A", " ".join(calls[0][0]), "the token never rides argv")
         self.assertEqual(calls[1][0][-4:], ["-s", "grazr-token-uuid-a", "-a", "me"])
+
+
+ULTRA = {"type": "claude_max", "tier": "default_claude_max_20x", "seat_tier": None}
+MAX_5X = {"type": "claude_max", "tier": "default_claude_max_5x", "seat_tier": None}
+
+
+def ultra_config(on=True):
+    return grazr.Config(thresholds=THRESHOLDS, accounts=[], enabled=True, dry_run=False, ultra_no_session=on)
+
+
+def ultra_account(identifier, snapshot=None, plan=ULTRA):
+    return Account(id=identifier, name=identifier, snapshot=snapshot, plan=plan)
+
+
+class IsUltraTest(unittest.TestCase):
+    def test_a_max_20x_tier_is_ultra(self):
+        self.assertTrue(core.is_ultra(ULTRA))
+
+    def test_a_max_20x_seat_tier_is_ultra(self):
+        self.assertTrue(core.is_ultra({"type": "claude_team", "tier": None, "seat_tier": "default_claude_max_20x"}))
+
+    def test_ultra_named_in_any_plan_field_is_ultra_whatever_the_case(self):
+        self.assertTrue(core.is_ultra({"type": "claude_ultra", "tier": None, "seat_tier": None}))
+        self.assertTrue(core.is_ultra({"type": "claude_max", "tier": "default_ULTRA", "seat_tier": None}))
+        self.assertTrue(core.is_ultra({"type": "claude_max", "tier": None, "seat_tier": "Ultra"}))
+
+    def test_max_5x_is_not_ultra(self):
+        self.assertFalse(core.is_ultra(MAX_5X))
+
+    def test_pro_and_team_are_not_ultra(self):
+        self.assertFalse(core.is_ultra({"type": "claude_pro", "tier": "default_claude_ai", "seat_tier": None}))
+        self.assertFalse(core.is_ultra({"type": "claude_team", "tier": "default_raven", "seat_tier": None}))
+
+    def test_a_missing_or_unreadable_plan_is_not_ultra(self):
+        self.assertFalse(core.is_ultra(None))
+        self.assertFalse(core.is_ultra({}))
+        self.assertFalse(core.is_ultra("default_claude_max_20x"))
+        self.assertFalse(core.is_ultra({"type": None, "tier": 20, "seat_tier": ["ultra"]}))
+
+
+class UltraDecisionTest(unittest.TestCase):
+    """The session window of an Ultra account is dropped before core decides,
+    so only its weekly window can move a pane."""
+
+    def test_an_ultra_active_account_at_5_percent_session_stays_with_the_flag_on(self):
+        active = ultra_account("work", [limit("session", 5), limit("weekly", 80)])
+        limits = grazr._decision_limits(active, active.snapshot, ultra_config(on=True))
+
+        self.assertEqual(decide(limits, "work", [account("personal")], NOW, THRESHOLDS), "stay")
+
+    def test_the_same_ultra_account_rotates_with_the_flag_off(self):
+        active = ultra_account("work", [limit("session", 5), limit("weekly", 80)])
+        limits = grazr._decision_limits(active, active.snapshot, ultra_config(on=False))
+
+        self.assertEqual(decide(limits, "work", [account("personal")], NOW, THRESHOLDS), ("rotate", "personal"))
+
+    def test_a_non_ultra_account_at_5_percent_session_rotates(self):
+        active = account("work", [limit("session", 5), limit("weekly", 80)])
+        limits = grazr._decision_limits(active, active.snapshot, ultra_config(on=True))
+
+        self.assertEqual(decide(limits, "work", [account("personal")], NOW, THRESHOLDS), ("rotate", "personal"))
+
+    def test_an_ultra_account_at_low_weekly_still_rotates(self):
+        active = ultra_account("work", [limit("session", 90), limit("weekly", 8)])
+        limits = grazr._decision_limits(active, active.snapshot, ultra_config(on=True))
+
+        self.assertEqual(decide(limits, "work", [account("personal")], NOW, THRESHOLDS), ("rotate", "personal"))
+
+    def test_the_session_window_is_dropped_and_weekly_and_per_model_kept(self):
+        snapshot = [
+            limit("session", 0),
+            limit("weekly", 60),
+            limit("weekly", 70, kind="weekly_opus", scope="Opus"),
+        ]
+        active = ultra_account("work", snapshot)
+
+        self.assertEqual(
+            grazr._decision_limits(active, snapshot, ultra_config(on=True)),
+            snapshot[1:],
+        )
+
+    def test_a_spent_session_window_does_not_stop_the_ultra_account_being_chosen(self):
+        parked = ultra_account("ultra", [limit("session", 0), limit("weekly", 80)])
+        other = account("personal", [limit("session", 50), limit("weekly", 50)])
+        enrolled = [account("work"), parked, other]
+
+        active_record, views = grazr._decision_setup(_no_live_paths(), enrolled, "work", ultra_config(on=True))
+
+        self.assertEqual(next_account("work", views, NOW, THRESHOLDS), "ultra")
+
+    def test_with_the_flag_off_a_spent_session_window_still_skips_the_account(self):
+        parked = ultra_account("ultra", [limit("session", 0), limit("weekly", 80)])
+        other = account("personal", [limit("session", 50), limit("weekly", 50)])
+        enrolled = [account("work"), parked, other]
+
+        _, views = grazr._decision_setup(_no_live_paths(), enrolled, "work", ultra_config(on=False))
+
+        self.assertEqual(next_account("work", views, NOW, THRESHOLDS), "personal")
+
+    def test_a_non_ultra_parked_account_with_a_spent_session_is_not_eligible(self):
+        parked = account("ultra", [limit("session", 0), limit("weekly", 80)])
+        other = account("personal", [limit("session", 50), limit("weekly", 50)])
+
+        _, views = grazr._decision_setup(
+            _no_live_paths(), [account("work"), parked, other], "work", ultra_config(on=True),
+        )
+
+        self.assertEqual(next_account("work", views, NOW, THRESHOLDS), "personal")
+
+    def test_a_refusal_on_the_active_account_still_moves_it_with_the_flag_on(self):
+        """A real refusal is the server's word. The failure path reads the
+        active account's limits as they are, so its spent session still counts."""
+        enrolled = [ultra_account("work"), ultra_account("personal", [limit("session", 50), limit("weekly", 50)])]
+        _, views = grazr._decision_setup(_no_live_paths(), enrolled, "work", ultra_config(on=True))
+        refused = [limit("session", 0), limit("weekly", 80)]
+
+        self.assertEqual(
+            grazr._after_failure(refused, "work", views, NOW, THRESHOLDS, pinned=False),
+            ("rotate", "personal"),
+        )
+
+    def test_the_stored_snapshot_keeps_every_window(self):
+        snapshot = [limit("session", 0), limit("weekly", 80)]
+        enrolled = [ultra_account("work"), ultra_account("ultra", snapshot)]
+
+        _, views = grazr._decision_setup(_no_live_paths(), enrolled, "work", ultra_config(on=True))
+
+        self.assertEqual(enrolled[1].snapshot, snapshot)
+        self.assertEqual(views[1].snapshot, snapshot[1:])
+
+    def test_the_live_profile_decides_the_active_account_plan(self):
+        """The stored record may predate an upgrade; the live profile names the
+        plan of the account in use."""
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = os.path.join(directory, ".claude.json")
+            with open(config_path, "w") as handle:
+                json.dump({"oauthAccount": {
+                    "organizationType": "claude_max", "organizationRateLimitTier": "default_claude_max_20x",
+                }}, handle)
+            paths = SimpleNamespace(config_path=config_path)
+            enrolled = [account_named("work", "work", [limit("session", 0), limit("weekly", 80)])]
+
+            active_record, views = grazr._decision_setup(paths, enrolled, "work", ultra_config(on=True))
+
+            self.assertTrue(core.is_ultra(active_record.plan))
+            self.assertEqual(grazr._decision_limits(active_record, [limit("session", 0), limit("weekly", 80)],
+                                                    ultra_config(on=True)), [limit("weekly", 80)])
+
+
+def _no_live_paths():
+    """Paths whose live config does not exist, so the stored plans decide."""
+    return SimpleNamespace(config_path=os.path.join(tempfile.gettempdir(), "grazr-no-such-config.json"))
+
+
+class UltraConfigTest(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.directory, True)
+        self.path = os.path.join(self.directory, "config.env")
+
+    def write(self, text):
+        with open(self.path, "w") as handle:
+            handle.write(text)
+
+    def test_the_default_config_turns_it_on(self):
+        self.assertIn("ULTRA_NO_SESSION=1", grazr.DEFAULT_CONFIG)
+        self.assertTrue(grazr.load_config(self.path).ultra_no_session)
+
+    def test_zero_turns_it_off(self):
+        self.write("ULTRA_NO_SESSION=0\n")
+
+        self.assertFalse(grazr.load_config(self.path).ultra_no_session)
+
+    def test_a_bad_value_names_the_key(self):
+        self.write("ULTRA_NO_SESSION=yes\n")
+
+        with self.assertRaisesRegex(ValueError, "ULTRA_NO_SESSION must be 0 or 1"):
+            grazr.load_config(self.path)
+
+    def test_set_accepts_it(self):
+        self.write("ENABLED=1\n")
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            grazr.set_setting("ULTRA_NO_SESSION", "0", path=self.path)
+
+        self.assertFalse(grazr.load_config(self.path).ultra_no_session)
+
+
+class UltraPlanLoadTest(unittest.TestCase):
+    def test_an_enrolled_account_carries_the_plan_stored_with_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            accounts_dir = os.path.join(directory, "accounts")
+            os.makedirs(accounts_dir)
+            with open(os.path.join(accounts_dir, "uuid-work.json"), "w") as handle:
+                json.dump({"name": "work", "oauthAccount": {
+                    "organizationType": "claude_max", "organizationRateLimitTier": "default_claude_max_20x",
+                }}, handle)
+            with open(os.path.join(accounts_dir, "uuid-old.json"), "w") as handle:
+                json.dump({"name": "old", "oauthAccount": {"accountUuid": "uuid-old"}}, handle)
+            paths = SimpleNamespace(accounts_dir=accounts_dir)
+
+            by_name = {entry.name: entry for entry in accounts.load(paths, [])}
+
+            self.assertTrue(core.is_ultra(by_name["work"].plan))
+            self.assertIsNone(by_name["old"].plan)
+
+
+class UltraStatuslineTest(EnrolledPairFixture):
+    """The status line is where a rotation starts, so the Ultra rule has to
+    hold there too."""
+
+    def set_plan(self, identifier, plan):
+        path = os.path.join(self.state_dir, "accounts", identifier + ".json")
+        with open(path) as handle:
+            stored = json.load(handle)
+        stored["oauthAccount"] = dict(stored["oauthAccount"], organizationType=plan["type"],
+                                      organizationRateLimitTier=plan["tier"], userRateLimitTier=plan["seat_tier"])
+        with open(path, "w") as handle:
+            json.dump(stored, handle)
+
+    def payload(self, session_used, weekly_used):
+        return json.dumps({"rate_limits": {
+            "five_hour": {"used_percentage": session_used, "resets_at": None},
+            "seven_day": {"used_percentage": weekly_used, "resets_at": None},
+        }})
+
+    def run_statusline(self, payload):
+        return self.invoke(
+            lambda runtime: grazr.statusline(runtime, payload, detach=lambda: grazr.decide(runtime))
+        )
+
+    def test_an_ultra_account_at_5_percent_session_stays_by_default(self):
+        self.set_plan("uuid-work", ULTRA)
+
+        self.run_statusline(self.payload(session_used=95, weekly_used=20))
+
+        self.assertEqual(self.rotations, [])
+
+    def test_the_same_ultra_account_rotates_with_the_flag_off(self):
+        self.set_plan("uuid-work", ULTRA)
+        self.write_config('ACCOUNTS="work personal"\nULTRA_NO_SESSION=0\n')
+
+        self.run_statusline(self.payload(session_used=95, weekly_used=20))
+
+        self.assertEqual(self.rotations[0][2:4], ("uuid-work", "uuid-personal"))
+
+    def test_a_non_ultra_account_at_5_percent_session_rotates(self):
+        self.set_plan("uuid-work", MAX_5X)
+
+        self.run_statusline(self.payload(session_used=95, weekly_used=20))
+
+        self.assertEqual(self.rotations[0][2:4], ("uuid-work", "uuid-personal"))
+
+    def test_an_ultra_account_at_low_weekly_rotates(self):
+        self.set_plan("uuid-work", ULTRA)
+
+        self.run_statusline(self.payload(session_used=10, weekly_used=95))
+
+        self.assertEqual(self.rotations[0][2:4], ("uuid-work", "uuid-personal"))
+
+    def test_the_status_report_marks_ultra_accounts_and_the_setting(self):
+        self.set_plan("uuid-work", ULTRA)
+
+        report = grazr.status_report(self.runtime())
+        by_name = {entry["name"]: entry for entry in report["accounts"]}
+
+        self.assertTrue(by_name["work"]["ultra"])
+        self.assertFalse(by_name["personal"]["ultra"])
+        self.assertTrue(report["settings"]["ultra_no_session"])
+
+    def test_the_status_report_shows_the_setting_off(self):
+        self.write_config('ACCOUNTS="work personal"\nULTRA_NO_SESSION=0\n')
+
+        self.assertFalse(grazr.status_report(self.runtime())["settings"]["ultra_no_session"])
 
 
 if __name__ == "__main__":

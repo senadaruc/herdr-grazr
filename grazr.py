@@ -29,17 +29,17 @@ import core
 import pins
 import stores
 
-# model_limits and parked_poll_minutes default off, and pinned_rotation to
-# exclude, so a Config built without them reads as before.
+# model_limits and parked_poll_minutes default off, pinned_rotation to
+# exclude and ultra_no_session on, so a Config built without them reads as before.
 Config = namedtuple(
-    "Config", "thresholds accounts enabled dry_run model_limits parked_poll_minutes pinned_rotation",
-    defaults=(False, 0, pins.EXCLUDE),
+    "Config", "thresholds accounts enabled dry_run model_limits parked_poll_minutes pinned_rotation ultra_no_session",
+    defaults=(False, 0, pins.EXCLUDE, True),
 )
 
 Runtime = namedtuple("Runtime", "paths store state_dir config")
 
 # Reported by `status --json`.
-VERSION = "0.4.7+fork.11"
+VERSION = "0.4.7+fork.12"
 
 DEFAULT_CONFIG = """\
 # Rotate when a limit group has less than this percent left.
@@ -54,10 +54,11 @@ DRY_RUN=0                # 1 = log the decision, do not swap
 MODEL_LIMITS=0           # 1 = also watch per-model weekly limits, from Claude's usage endpoint
 PARKED_POLL_MINUTES=0    # re-read parked accounts' usage this often, refreshing their tokens; 0 = never
 PINNED_ROTATION=exclude  # exclude = an account pinned to an agent is never rotated to; keep = it still is
+ULTRA_NO_SESSION=1       # 1 = Ultra accounts (Max 20x) rotate on the weekly limit only; 0 = on the 5-hour one too
 """
 
 _THRESHOLD_KEYS = {"REMAINING_SESSION": ("session", 15), "REMAINING_WEEKLY": ("weekly", 10)}
-_FLAG_KEYS = (("ENABLED", True), ("DRY_RUN", False), ("MODEL_LIMITS", False))
+_FLAG_KEYS = (("ENABLED", True), ("DRY_RUN", False), ("MODEL_LIMITS", False), ("ULTRA_NO_SESSION", True))
 
 LOG = "grazr.log"
 # Shared by install, enrol and status, so the wording that refuses a takeover lives once.
@@ -403,10 +404,12 @@ def act_on(decision, runtime, active_id, limits, enrolled=(), now=None, why=None
     now = now or datetime.now(timezone.utc)
     _record_arrival(state_dir, next_id, now)
     if why is None:
-        low = core.shortfall(limits or [], now, config.thresholds)
+        active_record = next((entry for entry in enrolled if entry.id == active_id), None)
+        judged = _decision_limits(active_record, limits, config) if active_record else limits
+        low = core.shortfall(judged or [], now, config.thresholds)
         if low:
             why = ", %s %d%% < %d%%" % (low.group, low.remaining, config.thresholds[low.group])
-        elif core.expiring_sooner(limits or [], active_id, enrolled, now, config.thresholds) == next_id:
+        elif core.expiring_sooner(judged or [], active_id, enrolled, now, config.thresholds) == next_id:
             why = ", its week ends sooner"
         else:
             why = ""
@@ -578,7 +581,7 @@ def load_config(path):
     return Config(
         thresholds=thresholds, accounts=accounts, enabled=flags[0], dry_run=flags[1],
         model_limits=flags[2], parked_poll_minutes=parked_poll_minutes,
-        pinned_rotation=pinned_rotation,
+        pinned_rotation=pinned_rotation, ultra_no_session=flags[3],
     )
 
 
@@ -785,9 +788,12 @@ def statusline(runtime=None, payload=None, spawn=subprocess.run, detach=None):
     # The status line never carries a per-model limit; merged() keeps the last
     # one the usage endpoint gave, and it binds only while a pane is on that model.
     models = _models_in_use(state_dir, now)
-    relevant = _relevant(limits, models)
+    active_record, usable = _decision_setup(
+        paths, _bound(_usable(state_dir, enrolled, active, now, config), models), active, config,
+    )
+    relevant = _decision_limits(active_record, _relevant(limits, models), config)
     rotate = core.needs_rotation(relevant, now, config.thresholds) or bool(core.expiring_sooner(
-        relevant, active, _bound(_usable(state_dir, enrolled, active, now, config), models), now, config.thresholds
+        relevant, active, usable, now, config.thresholds
     ))
     due = config.model_limits and _scoped_due(state_dir, store, active, now)
     if not rotate and not due:
@@ -824,6 +830,32 @@ def _pinned_reading(runtime, account_id, limits, now):
             "%s %d%% left. Its agent stays on it; pin it elsewhere to move it" % (_window_name(low), low.remaining),
         )
     return 0
+
+
+def _decision_limits(record, limits, config):
+    """The windows core decides on for one account. With ULTRA_NO_SESSION on, an
+    Ultra account's 5-hour window is dropped, since Anthropic is removing it and
+    only the weekly limit still binds. The stored snapshots keep every window;
+    this is applied to the copy handed to core, never to what is recorded."""
+    if not config.ultra_no_session or not core.is_ultra(record.plan) or not isinstance(limits, list):
+        return limits
+    return [entry for entry in limits if entry.group != "session"]
+
+
+def _decision_setup(paths, enrolled, active, config):
+    """The active account as core should see it, and the enrolled accounts with
+    their session windows dropped where `_decision_limits` says so. The active
+    account's plan comes from Claude's live profile when that names one, since
+    it is the account in use. Returns (active record, accounts)."""
+    live = accounts.plan_of(_live_oauth(paths))
+    views = []
+    for entry in enrolled:
+        record = entry._replace(plan=live if entry.id == active and live is not None else entry.plan)
+        views.append(record._replace(snapshot=_decision_limits(record, entry.snapshot, config)))
+    active_record = next((entry for entry in views if entry.id == active), None)
+    if active_record is None:
+        active_record = core.Account(active, None, None, live)
+    return active_record, views
 
 
 def _relevant(snapshot, models):
@@ -1191,8 +1223,14 @@ def _decide(runtime):
         if limits is None:
             return 0
         models = _models_in_use(state_dir, now)
-        enrolled = _bound(_usable(state_dir, accounts.load(paths, config.accounts), active, now, config), models)
-        decision = core.decide(_relevant(limits, models), active, enrolled, now, config.thresholds)
+        active_record, enrolled = _decision_setup(
+            paths, _bound(_usable(state_dir, accounts.load(paths, config.accounts), active, now, config), models),
+            active, config,
+        )
+        decision = core.decide(
+            _decision_limits(active_record, _relevant(limits, models), config), active, enrolled, now,
+            config.thresholds,
+        )
         # rotate refuses this too, but a raised error suits the person who just
         # pressed a key, not every message of every pane.
         if isinstance(decision, tuple):
@@ -1290,9 +1328,16 @@ def recover(runtime=None, error=None, failed=None, now=None):
         else:
             _block(state_dir, active, error, limits, now)
             pinned = False
-        enrolled = _bound(
-            _usable(state_dir, accounts.load(paths, config.accounts), active, now, config),
-            _models_in_use(state_dir, now),
+        # The refused account's limits stay as read: a real refusal is the
+        # server's word and must still move the pane. Only the accounts it
+        # could move to lose their session windows, Ultra ones included.
+        _, enrolled = _decision_setup(
+            paths,
+            _bound(
+                _usable(state_dir, accounts.load(paths, config.accounts), active, now, config),
+                _models_in_use(state_dir, now),
+            ),
+            active, config,
         )
         decision = _after_failure(limits, active, enrolled, now, config.thresholds, pinned)
         if isinstance(decision, tuple):
@@ -1843,6 +1888,7 @@ def status_report(runtime, now=None):
     failure_hook = claude.failure_hook_installed(paths.config_dir, _failure_command(state_dir))
     last = _last_rotation(state_dir)
     live_oauth = _live_oauth(paths)
+    plans = {entry.id: _account_plan(paths, entry.id, active, live_oauth) for entry in everyone}
     return {
         "installed": statusline and failure_hook,
         "connection": {
@@ -1865,7 +1911,8 @@ def status_report(runtime, now=None):
                 "name": entry.name,
                 "email": _email_of(paths, entry.id),
                 "organization": _organization_of(paths, entry.id),
-                "plan": _account_plan(paths, entry.id, active, live_oauth),
+                "plan": plans[entry.id],
+                "ultra": core.is_ultra(plans[entry.id]),
                 "parked":accounts.has_parked_credential(store, entry.id),
                 "snapshot": accounts.snapshot_to_json(entry.snapshot),
                 "blocked": blocked[entry.id].get("reason") if entry.id in blocked else None,
@@ -1883,6 +1930,7 @@ def status_report(runtime, now=None):
             "model_limits": config.model_limits,
             "parked_poll_minutes": config.parked_poll_minutes,
             "pinned_rotation": config.pinned_rotation,
+            "ultra_no_session": config.ultra_no_session,
             "config_path": _config_path(),
             "state_dir": state_dir,
             # Same fallback as notify, so an empty GRAZR_NOTIFIER reads as Herdr there too.
@@ -1928,29 +1976,18 @@ def _live_oauth(paths):
     return oauth if isinstance(oauth, dict) else None
 
 
-def _plan_of(oauth):
-    """The plan Claude's OAuth profile names, or None without an organizationType."""
-    if not isinstance(oauth, dict) or not oauth.get("organizationType"):
-        return None
-    return {
-        "type": oauth["organizationType"],
-        "tier": oauth.get("organizationRateLimitTier"),
-        "seat_tier": oauth.get("userRateLimitTier"),
-    }
-
-
 def _account_plan(paths, identifier, active_id, live_oauth):
     """The active account's live profile when it names a plan, else the stored
     record's. Other accounts report the stored record's plan."""
     if identifier == active_id:
-        live = _plan_of(live_oauth)
+        live = accounts.plan_of(live_oauth)
         if live is not None:
             return live
     try:
         oauth = accounts.read(paths, identifier).get("oauthAccount")
     except (OSError, ValueError):
         return None
-    return _plan_of(oauth)
+    return accounts.plan_of(oauth)
 
 
 def _last_rotation(state_dir):
@@ -2396,7 +2433,7 @@ def token_forget(runtime=None, target=None):
     return 0
 
 
-SETTABLE = {"ACCOUNTS": None, "PINNED_ROTATION": pins.ROTATION_MODES, "ENABLED": ("0", "1")}
+SETTABLE = {"ACCOUNTS": None, "PINNED_ROTATION": pins.ROTATION_MODES, "ENABLED": ("0", "1"), "ULTRA_NO_SESSION": ("0", "1")}
 
 
 def set_setting(key, value, path=None, enrolled=None):
