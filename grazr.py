@@ -39,7 +39,7 @@ Config = namedtuple(
 Runtime = namedtuple("Runtime", "paths store state_dir config")
 
 # Reported by `status --json`.
-VERSION = "0.4.7+fork.12"
+VERSION = "0.4.7+fork.13"
 
 DEFAULT_CONFIG = """\
 # Rotate when a limit group has less than this percent left.
@@ -1948,7 +1948,7 @@ def status_report(runtime, now=None):
             identifier: {"reason": entry.get("reason"), "at": entry.get("at"), "until": entry.get("until")}
             for identifier, entry in blocked.items()
         },
-        "changed_at": last["at"] if last else None,
+        "changed_at": _changed_at(state_dir, _config_path()),
         "last_rotation": last,
         "last_reported": _last_decision(state_dir),
         "managed_profile": managed_claude_home(),
@@ -1996,6 +1996,21 @@ def _account_plan(paths, identifier, active_id, live_oauth):
     except (OSError, ValueError):
         return None
     return accounts.plan_of(oauth)
+
+
+def _changed_at(state_dir, config_path):
+    """When this host's rotation last changed: the newer of config.env's write
+    (an order set by hand or by a client keeping hosts in step) and the last
+    swap. None before either, or on an older state."""
+    stamps = []
+    try:
+        stamps.append(os.path.getmtime(config_path))
+    except OSError:
+        pass
+    last = _last_rotation(state_dir)
+    if last:
+        stamps.append(last["at"])
+    return max(stamps) if stamps else None
 
 
 def _last_rotation(state_dir):

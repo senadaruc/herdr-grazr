@@ -3357,7 +3357,8 @@ class StatusJsonTest(EnrolledPairFixture):
         self.assertEqual(set(report["blocked"]["uuid-work"]), {"reason", "at", "until"})
 
     def test_nothing_has_swapped_yet_reads_as_none(self):
-        report = self.report()
+        # No config.env in the directory either: nothing has changed on this host.
+        report = self.report(GRAZR_CONFIG_DIR=self.claude_dir)
 
         self.assertIsNone(report["changed_at"])
         self.assertIsNone(report["last_rotation"])
@@ -3366,10 +3367,23 @@ class StatusJsonTest(EnrolledPairFixture):
         with open(os.path.join(self.state_dir, grazr.LAST_ROTATION), "w") as handle:
             json.dump({"to": "uuid-personal", "at": 123.5}, handle)
 
-        report = self.report()
+        report = self.report(GRAZR_CONFIG_DIR=self.claude_dir)
 
         self.assertEqual(report["changed_at"], 123.5)
         self.assertEqual(report["last_rotation"], {"to": "uuid-personal", "at": 123.5})
+
+    def test_changed_at_is_the_newer_of_the_config_write_and_the_last_swap(self):
+        """A client that sets ACCOUNTS writes config.env, which is a change of
+        the rotation as much as a swap is; the newest of the two is reported."""
+        config = os.path.join(self.state_dir, "config.env")
+        with open(os.path.join(self.state_dir, grazr.LAST_ROTATION), "w") as handle:
+            json.dump({"to": "uuid-personal", "at": 1000.0}, handle)
+
+        os.utime(config, (2000.0, 2000.0))
+        self.assertEqual(self.report(GRAZR_CONFIG_DIR=self.state_dir)["changed_at"], 2000.0)
+
+        os.utime(config, (500.0, 500.0))
+        self.assertEqual(self.report(GRAZR_CONFIG_DIR=self.state_dir)["changed_at"], 1000.0)
 
     def test_installed_once_grazr_owns_both_the_status_line_and_the_failure_hook(self):
         self.invoke(grazr.install)

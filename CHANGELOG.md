@@ -4,6 +4,12 @@ Notable changes to *grazr*, newest first. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.4.7+fork.13 - 2026-11-05
+
+### Changed
+
+- `status --json` reports `changed_at` as the newer of config.env's write and the last swap, so a client keeping several hosts in step sees an order set by `set ACCOUNTS` as a change of that host's rotation.
+
 ## 0.4.7+fork.12 - 2026-10-31
 
 ### Changed
