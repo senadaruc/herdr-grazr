@@ -2860,6 +2860,8 @@ class EnrolledPairFixture(unittest.TestCase):
         # Only what Herdr genuinely passes in the environment. Everything else
         # is handed over, so nothing here can reach the real keychain.
         environment.setdefault("HERDR_PANE_ID", "")
+        # The fixture's own config, so an enrol never writes the real one.
+        environment.setdefault("GRAZR_CONFIG_DIR", self.state_dir)
         printed = io.StringIO()
 
         with mock.patch.dict(os.environ, environment, clear=True), mock.patch.object(
@@ -6919,10 +6921,39 @@ class NonInteractiveEnrolTest(EnrolledPairFixture):
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(printed), {
             "ok": True, "id": self.NEW, "name": "new", "email": "new@imperum.io", "unblocked": False,
+            "ordered": True,
         })
         self.assertEqual(self.store.parked[self.NEW], self.BLOB)
         self.assertEqual(self.record()["name"], "new")
         self.assertNotIn(self.BLOB, printed)
+
+    def config_text(self):
+        with open(os.path.join(self.state_dir, "config.env")) as handle:
+            return handle.read()
+
+    def test_a_new_account_joins_the_end_of_the_order_and_the_file_keeps_its_other_lines(self):
+        self.write_config('ACCOUNTS="work personal"  # order\nENABLED=1\n')
+
+        self.enrol(from_dir=self.isolated, name="new", as_json=True)
+
+        self.assertEqual(self.config_text(), 'ACCOUNTS="work personal new"  # order\nENABLED=1\n')
+
+    def test_an_empty_order_stays_empty_since_it_already_means_every_account(self):
+        self.write_config('ACCOUNTS=""\n')
+
+        _, printed = self.enrol(from_dir=self.isolated, name="new", as_json=True)
+
+        self.assertEqual(self.config_text(), 'ACCOUNTS=""\n')
+        self.assertEqual(json.loads(printed)["ordered"], False)
+
+    def test_enrolling_an_account_again_does_not_put_it_in_an_order_it_was_left_out_of(self):
+        self.enrol(from_dir=self.isolated, name="new", as_json=True)
+        self.write_config('ACCOUNTS="work personal"\n')
+
+        code, printed = self.enrol(from_dir=self.isolated, name="new", as_json=True)
+
+        self.assertEqual((code, json.loads(printed)["ordered"]), (0, False))
+        self.assertEqual(self.config_text(), 'ACCOUNTS="work personal"\n')
 
     def test_expect_email_matches_case_insensitively(self):
         code, printed = self.enrol(from_dir=self.isolated, name="new", expect_email="NEW@Imperum.IO", as_json=True)

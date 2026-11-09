@@ -95,6 +95,9 @@ Pick `s` for the account you are logged into now. Pick `l` for each extra one.
 logged out. One keypress, no Return. `q` or `Esc` closes the pane without
 changing anything.
 
+A new account joins the end of `ACCOUNTS` by itself. Move it there to change
+its place; an empty `ACCOUNTS` already rotates through every account.
+
 Enrolling also connects *grazr* to Claude's status line and keeps the one you
 have. If you later change `statusLine` in `~/.claude/settings.json` by hand,
 *grazr* sees no usage. It says so in a toast when a Claude pane starts, and the

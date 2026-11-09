@@ -39,7 +39,7 @@ Config = namedtuple(
 Runtime = namedtuple("Runtime", "paths store state_dir config")
 
 # Reported by `status --json`.
-VERSION = "0.4.7+fork.13"
+VERSION = "0.4.7+fork.14"
 
 DEFAULT_CONFIG = """\
 # Rotate when a limit group has less than this percent left.
@@ -2177,6 +2177,7 @@ def _enrol_from(runtime, source):
     if not name:
         print("A name is required")
         return 1
+    known = _enrolled_ids(paths)
     try:
         identifier = _enrol_between_rotations(runtime, name, source)
     except RuntimeError as error:
@@ -2185,7 +2186,10 @@ def _enrol_from(runtime, source):
     print("\nEnrolled %s as %s" % (name, identifier))
     if _unblock(state_dir, identifier, datetime.now(timezone.utc)):
         print("It had failed before, and is back in rotation")
-    print('Add it to ACCOUNTS in %s' % _config_path())
+    if identifier not in known and _join_order(name):
+        print("Added it to the end of ACCOUNTS in %s" % _config_path())
+    else:
+        print('Add it to ACCOUNTS in %s' % _config_path())
     # Checked before either slot is written, so a split between two grazrs never happens.
     shim = _shim_command(state_dir)
     hook = _failure_command(state_dir)
@@ -2206,6 +2210,31 @@ def _enrol_from(runtime, source):
         # Enrolling worked. Settings that cannot be read are reported, not raised.
         print("grazr: %s" % error)
     return 0
+
+
+def _enrolled_ids(paths):
+    try:
+        return {entry.id for entry in accounts.load(paths, [])}
+    except OSError:
+        return set()
+
+
+def _join_order(name, path=None):
+    """Put a newly enrolled account at the end of ACCOUNTS. An empty ACCOUNTS
+    already means every account, and a config that is absent or unreadable is
+    left alone: the enrol has happened and must not fail on this."""
+    path = path or _config_path()
+    try:
+        if not os.path.exists(path):
+            return False
+        order = load_config(path).accounts
+        # A name `set ACCOUNTS` could not write back is left for the user to list.
+        if not order or name in order or name != "".join(name.split()) or '"' in name or "\\" in name:
+            return False
+        _write_setting(path, "ACCOUNTS", '"%s"' % " ".join(order + [name]))
+        return True
+    except (OSError, ValueError):
+        return False
 
 
 def _enrol_between_rotations(runtime, name, source):
@@ -2293,6 +2322,7 @@ def enrol_noninteractive(from_dir=None, stdin=False, name=None, expect_email=Non
     paths, store, state_dir, _ = runtime
     if from_dir:
         from_dir = os.path.abspath(from_dir)
+    known = _enrolled_ids(paths)
     try:
         if stdin:
             identity, blob = _read_import(sys.stdin.read())
@@ -2315,12 +2345,20 @@ def enrol_noninteractive(from_dir=None, stdin=False, name=None, expect_email=Non
         unblocked = _unblock(state_dir, identifier, datetime.now(timezone.utc))
     except Exception:
         unblocked = False
+    try:
+        ordered = identifier not in known and _join_order(name)
+    except Exception:
+        ordered = False
     if as_json:
-        print(json.dumps({"ok": True, "id": identifier, "name": name, "email": email, "unblocked": unblocked}))
+        print(json.dumps({
+            "ok": True, "id": identifier, "name": name, "email": email, "unblocked": unblocked, "ordered": ordered,
+        }))
     else:
         print("Enrolled %s as %s" % (name, identifier))
         if unblocked:
             print("It had failed before, and is back in rotation")
+        if ordered:
+            print("Added it to the end of ACCOUNTS in %s" % _config_path())
     return 0
 
 
@@ -2485,6 +2523,12 @@ def set_setting(key, value, path=None, enrolled=None):
         written = value
     path = path or _config_path()
     load_config(path)
+    _write_setting(path, key, written)
+    print("%s=%s" % (key, value))
+    return 0
+
+
+def _write_setting(path, key, written):
     with open(path) as handle:
         lines = handle.read().splitlines(True)
     replaced = False
@@ -2498,8 +2542,6 @@ def set_setting(key, value, path=None, enrolled=None):
             lines[-1] += "\n"
         lines.append("%s=%s\n" % (key, written))
     atomic.write(path, "".join(lines))
-    print("%s=%s" % (key, value))
-    return 0
 
 
 def _shim_dirs(state_dir):

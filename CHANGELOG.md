@@ -4,6 +4,12 @@ Notable changes to *grazr*, newest first. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.4.7+fork.14 - 2026-11-09
+
+### Changed
+
+- Enrolling a new account adds it to the end of `ACCOUNTS` in config.env, so it rotates without a hand edit. An empty `ACCOUNTS` stays empty, since it already means every account, and enrolling an account again leaves the order as it is. `enrol --json` reports this as `"ordered"`.
+
 ## 0.4.7+fork.13 - 2026-11-05
 
 ### Changed
