@@ -39,7 +39,7 @@ Config = namedtuple(
 Runtime = namedtuple("Runtime", "paths store state_dir config")
 
 # Reported by `status --json`.
-VERSION = "0.4.7+fork.14"
+VERSION = "0.4.7+fork.15"
 
 DEFAULT_CONFIG = """\
 # Rotate when a limit group has less than this percent left.
@@ -108,6 +108,10 @@ MODEL_RECENT_SECONDS = 15 * 60
 # still reads as spent until its reset.
 PARKED_STATE = "parked.json"        # {"at": unix time of the last poll}
 PARKED_LOCK = "parked.lock"
+# Whether each account holds an unused limit reset, as Claude Code last noted
+# it. Claude keeps one note, for the account it last asked about; the server
+# gives the list of resets to Claude's own clients only, so this is all there is.
+UNUSED_RESETS = "unused_resets.json"  # {account id: {holds, checked_at, valid_until}}
 
 TAG = "grazr"
 ESCAPE = "\x1b"
@@ -1895,8 +1899,10 @@ def status_report(runtime, now=None):
     statusline = claude.statusline_installed(paths.config_dir, _record_path(state_dir), state_dir)
     failure_hook = claude.failure_hook_installed(paths.config_dir, _failure_command(state_dir))
     last = _last_rotation(state_dir)
-    live_oauth = _live_oauth(paths)
+    live = _live_config(paths)
+    live_oauth = _oauth_of(live)
     plans = {entry.id: _account_plan(paths, entry.id, active, live_oauth) for entry in everyone}
+    unused_resets = _unused_resets(state_dir, live, active, now)
     return {
         "installed": statusline and failure_hook,
         "connection": {
@@ -1927,6 +1933,7 @@ def status_report(runtime, now=None):
                 "in_order": entry.id in ordered_ids,
                 "first_reading_due": accounts.first_reading_due(paths, entry.id),
                 "updated": accounts.updated_at(paths, entry.id),
+                "unused_reset": unused_resets.get(entry.id),
             }
             for entry in everyone
         ],
@@ -1973,15 +1980,76 @@ def _organization_of(paths, identifier):
     return organization if isinstance(organization, str) else None
 
 
-def _live_oauth(paths):
-    """The live `oauthAccount` in Claude's config file, None when the file is
-    missing, unreadable or lacks it. Read once per report."""
+def _live_config(paths):
+    """Claude's config file as a dict, None when it is missing or unreadable.
+    Read once per report."""
     try:
         with open(paths.config_path) as handle:
-            oauth = json.load(handle).get("oauthAccount")
-    except (OSError, ValueError, AttributeError):
+            config = json.load(handle)
+    except (OSError, ValueError):
         return None
+    return config if isinstance(config, dict) else None
+
+
+def _oauth_of(config):
+    oauth = config.get("oauthAccount") if config else None
     return oauth if isinstance(oauth, dict) else None
+
+
+def _live_oauth(paths):
+    """The live `oauthAccount` in Claude's config file, None when the file is
+    missing, unreadable or lacks it."""
+    return _oauth_of(_live_config(paths))
+
+
+def _noted_unused_reset(config):
+    """(account id, note) from Claude Code's `unusedLimitResetStatusCache`, or
+    None when Claude holds no readable note. Its times are in milliseconds."""
+    note = config.get("unusedLimitResetStatusCache") if config else None
+    try:
+        identifier, holds = note["accountUuid"], note["holdsUnusedReset"]
+        checked_at, valid_until = note["checkedAt"] / 1000, note["validUntil"] / 1000
+    except (TypeError, KeyError):
+        return None
+    if not isinstance(identifier, str) or not identifier or not isinstance(holds, bool):
+        return None
+    return identifier, {"holds": holds, "checked_at": checked_at, "valid_until": valid_until}
+
+
+def _unused_resets(state_dir, config, active, now):
+    """{account id: {holds, checked_at, valid_until}} for every account whose
+    note is still current. Claude's one note is kept per account here, so an
+    account parked since is still known. Claude drops its note when a reset is
+    used, and with it goes what was kept for the active account: that is the
+    account the reset was used on. A config or a note that cannot be read
+    changes nothing."""
+    path = os.path.join(state_dir, UNUSED_RESETS)
+    try:
+        with open(path) as handle:
+            kept = json.load(handle)
+    except (OSError, ValueError):
+        kept = {}
+    if not isinstance(kept, dict):
+        kept = {}
+    known = dict(kept)
+    noted = _noted_unused_reset(config)
+    if noted is not None:
+        known[noted[0]] = noted[1]
+    elif config is not None and "unusedLimitResetStatusCache" not in config:
+        known.pop(active, None)
+    if known != kept:
+        try:
+            atomic.write(path, json.dumps(known))
+        except OSError:
+            pass
+    current = {}
+    for identifier, note in known.items():
+        try:
+            if note["checked_at"] <= now.timestamp() < note["valid_until"] and isinstance(note["holds"], bool):
+                current[identifier] = note
+        except (TypeError, KeyError):
+            continue
+    return current
 
 
 def _account_plan(paths, identifier, active_id, live_oauth):

@@ -331,6 +331,8 @@ Sign-in without a terminal (used by the Orca plugin) runs on the same engine: `e
 
 `status --json` gives each account an `updated` field: the unix time of its last recorded reading (the mtime of its state file), or `null` when unknown.
 
+It also gives each account an `unused_reset` field: `{"holds": true|false, "checked_at", "valid_until"}` (unix times) when Claude Code has noted whether the account holds an unused limit reset, or `null` when it has made no note or the note has lapsed. This is Claude Code's own note, kept per account as accounts rotate; it does not say which kind of reset or how many. Use one with `/limit-reset` in Claude Code on that account.
+
 Outside Herdr, `GRAZR_STATE_DIR` and `GRAZR_CONFIG_DIR` name the state and
 config directories. They take precedence over `HERDR_PLUGIN_STATE_DIR` and
 `HERDR_PLUGIN_CONFIG_DIR`. The Orca plugin uses `~/.local/state/orca-grazr` and

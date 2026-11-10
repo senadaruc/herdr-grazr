@@ -4,6 +4,12 @@ Notable changes to *grazr*, newest first. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.4.7+fork.15 - 2026-11-10
+
+### Added
+
+- `status --json` gives each account an `unused_reset` field: `{"holds", "checked_at", "valid_until"}` when Claude Code has noted whether that account holds an unused limit reset, else `null`. The note is Claude Code's own (`unusedLimitResetStatusCache` in its config file), which it keeps for one account at a time; grazr remembers it per account in `unused_resets.json`, so a parked account is still known, and stops reporting it once its validity has passed. When Claude drops its note, which it does when a reset is used, the active account's is forgotten. grazr asks the server nothing for this: Anthropic gives the list of resets (kinds, counts, expiry) to its own clients only, and a reset is used with Claude Code's `/limit-reset`.
+
 ## 0.4.7+fork.14 - 2026-11-09
 
 ### Changed

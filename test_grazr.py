@@ -3216,7 +3216,7 @@ class StatusJsonTest(EnrolledPairFixture):
         self.assertEqual([entry["name"] for entry in report["accounts"]], ["personal", "work"])
         self.assertEqual(set(report["accounts"][0]), {
             "id", "name", "email", "organization", "plan", "ultra", "parked", "snapshot", "blocked", "in_order",
-            "first_reading_due", "updated",
+            "first_reading_due", "updated", "unused_reset",
         })
         self.assertEqual(report["accounts"][0]["id"], "uuid-personal")
         self.assertIsNone(report["accounts"][0]["snapshot"])
@@ -3251,6 +3251,89 @@ class StatusJsonTest(EnrolledPairFixture):
         self.assertFalse(by_name["personal"]["in_order"])
         self.assertTrue(by_name["work"]["in_order"])
         self.assertEqual(report["order"], ["work"])
+
+    def note_unused_reset(self, note):
+        """Claude Code's own note in its config file; None removes it."""
+        path = os.path.join(self.claude_dir, ".claude.json")
+        with open(path) as handle:
+            config = json.load(handle)
+        config.pop("unusedLimitResetStatusCache", None)
+        if note is not None:
+            config["unusedLimitResetStatusCache"] = note
+        with open(path, "w") as handle:
+            json.dump(config, handle)
+
+    def unused_resets(self):
+        return {entry["name"]: entry["unused_reset"] for entry in self.report()["accounts"]}
+
+    def claude_note(self, identifier, holds=True, checked_ago=60, valid_for=3600):
+        now_ms = time.time() * 1000
+        return {
+            "accountUuid": identifier, "holdsUnusedReset": holds,
+            "checkedAt": now_ms - checked_ago * 1000, "validUntil": now_ms + valid_for * 1000,
+        }
+
+    def test_an_account_claude_noted_an_unused_reset_for_reports_it(self):
+        note = self.claude_note("uuid-work")
+        self.note_unused_reset(note)
+
+        resets = self.unused_resets()
+
+        self.assertEqual(resets["work"], {
+            "holds": True, "checked_at": note["checkedAt"] / 1000, "valid_until": note["validUntil"] / 1000,
+        })
+        self.assertIsNone(resets["personal"])
+
+    def test_a_note_that_says_no_reset_is_reported_as_none_held(self):
+        self.note_unused_reset(self.claude_note("uuid-work", holds=False))
+
+        self.assertIs(self.unused_resets()["work"]["holds"], False)
+
+    def test_a_parked_account_keeps_the_note_claude_made_while_it_was_live(self):
+        self.note_unused_reset(self.claude_note("uuid-personal"))
+        self.unused_resets()
+        self.note_unused_reset(self.claude_note("uuid-work", holds=False))
+
+        resets = self.unused_resets()
+
+        self.assertIs(resets["personal"]["holds"], True)
+        self.assertIs(resets["work"]["holds"], False)
+
+    def test_a_note_claude_dropped_forgets_the_active_account_only(self):
+        """Claude drops its note when a reset is used, on the account it is on."""
+        self.note_unused_reset(self.claude_note("uuid-personal"))
+        self.unused_resets()
+        self.note_unused_reset(self.claude_note("uuid-work"))
+        self.unused_resets()
+        self.note_unused_reset(None)
+
+        resets = self.unused_resets()
+
+        self.assertIsNone(resets["work"])
+        self.assertIs(resets["personal"]["holds"], True)
+
+    def test_a_note_past_its_validity_is_not_reported(self):
+        self.note_unused_reset(self.claude_note("uuid-work", checked_ago=7200, valid_for=-3600))
+
+        self.assertIsNone(self.unused_resets()["work"])
+
+    def test_a_garbled_note_reports_nothing_new_and_keeps_what_was_known(self):
+        self.note_unused_reset(self.claude_note("uuid-work"))
+        self.unused_resets()
+        self.note_unused_reset({"accountUuid": "uuid-personal", "holdsUnusedReset": "yes"})
+
+        resets = self.unused_resets()
+
+        self.assertIsNone(resets["personal"])
+        self.assertIs(resets["work"]["holds"], True)
+
+    def test_an_unreadable_claude_config_keeps_what_was_known(self):
+        self.note_unused_reset(self.claude_note("uuid-work"))
+        self.unused_resets()
+        with open(os.path.join(self.claude_dir, ".claude.json"), "w") as handle:
+            handle.write("{not json")
+
+        self.assertIs(self.unused_resets()["work"]["holds"], True)
 
     def test_each_account_carries_the_organization_stored_at_enrolment_or_none(self):
         path = os.path.join(self.state_dir, "accounts", "uuid-personal.json")
