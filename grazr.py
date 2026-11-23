@@ -39,7 +39,7 @@ Config = namedtuple(
 Runtime = namedtuple("Runtime", "paths store state_dir config")
 
 # Reported by `status --json`.
-VERSION = "0.4.7+fork.15"
+VERSION = "0.4.7+fork.16"
 
 DEFAULT_CONFIG = """\
 # Rotate when a limit group has less than this percent left.
@@ -1679,7 +1679,8 @@ def _dispatch(argv):
         print("usage: grazr.py %s" % "|".join(
             list(entry_points) + ["install --force", "pin PANE ACCOUNT", "unpin PANE", "token ACCOUNT",
                                   "token-forget ACCOUNT", "set ACCOUNTS|PINNED_ROTATION|ENABLED VALUE",
-                                  "enrol --from DIR|--stdin --name NAME [--expect-email EMAIL] [--json]",
+                                  "enrol --from DIR|--stdin --name NAME [--expect-email EMAIL] "
+                                  "[--expect-organization UUID] [--json]",
                                   "login-export --from DIR", "login-discard --from DIR"]
         ), file=sys.stderr)
         return 2
@@ -1902,7 +1903,8 @@ def status_report(runtime, now=None):
     live = _live_config(paths)
     live_oauth = _oauth_of(live)
     plans = {entry.id: _account_plan(paths, entry.id, active, live_oauth) for entry in everyone}
-    unused_resets = _unused_resets(state_dir, live, active, now)
+    logins = {entry.id: _login_of(paths, entry.id) for entry in everyone}
+    unused_resets = _unused_resets(paths, state_dir, live, active, now)
     return {
         "installed": statusline and failure_hook,
         "connection": {
@@ -1918,11 +1920,17 @@ def status_report(runtime, now=None):
             "name": _name_of(everyone, active),
             "enrolled": active in enrolled_ids,
             "in_order": active in ordered_ids,
+            # From the live login, so an organization that is not enrolled can still be named.
+            "email": _string_in(live_oauth, "emailAddress"),
+            "organization": _string_in(live_oauth, "organizationName"),
+            "organization_uuid": _string_in(live_oauth, "organizationUuid"),
         },
         "accounts": [
             {
                 "id": entry.id,
                 "name": entry.name,
+                "login": logins[entry.id][0],
+                "organization_uuid": logins[entry.id][1],
                 "email": _email_of(paths, entry.id),
                 "organization": _organization_of(paths, entry.id),
                 "plan": plans[entry.id],
@@ -1972,6 +1980,22 @@ def _email_of(paths, identifier):
     return email if isinstance(email, str) else None
 
 
+def _login_of(paths, identifier):
+    """(accountUuid, organizationUuid) of an account's record. A record that
+    stores no accountUuid is the login its id names, as before ids carried
+    organizations; an id is never split to find it."""
+    try:
+        login, organization = accounts.login_of(accounts.read(paths, identifier))
+    except (OSError, ValueError):
+        login, organization = None, None
+    return login or identifier, organization
+
+
+def _string_in(mapping, key):
+    value = mapping.get(key) if isinstance(mapping, dict) else None
+    return value if isinstance(value, str) else None
+
+
 def _organization_of(paths, identifier):
     try:
         organization = accounts.read(paths, identifier).get("organization")
@@ -2002,21 +2026,32 @@ def _live_oauth(paths):
     return _oauth_of(_live_config(paths))
 
 
-def _noted_unused_reset(config):
+def _noted_unused_reset(paths, config, active):
     """(account id, note) from Claude Code's `unusedLimitResetStatusCache`, or
-    None when Claude holds no readable note. Its times are in milliseconds."""
+    None when Claude holds no readable note or it names no account grazr can
+    tell. Its times are in milliseconds. The note names a login only, not its
+    organization: the live login's is the active account's, another login's
+    is its one record's, and a login with several is left unknown."""
     note = config.get("unusedLimitResetStatusCache") if config else None
     try:
-        identifier, holds = note["accountUuid"], note["holdsUnusedReset"]
+        login, holds = note["accountUuid"], note["holdsUnusedReset"]
         checked_at, valid_until = note["checkedAt"] / 1000, note["validUntil"] / 1000
     except (TypeError, KeyError):
         return None
-    if not isinstance(identifier, str) or not identifier or not isinstance(holds, bool):
+    if not isinstance(login, str) or not login or not isinstance(holds, bool):
         return None
+    live = (_oauth_of(config) or {}).get("accountUuid")
+    if active is not None and isinstance(live, str) and live.lower() == login.lower():
+        identifier = active
+    else:
+        found = accounts.records_of_login(paths, login)
+        if len(found) != 1:
+            return None
+        identifier = found[0][0]
     return identifier, {"holds": holds, "checked_at": checked_at, "valid_until": valid_until}
 
 
-def _unused_resets(state_dir, config, active, now):
+def _unused_resets(paths, state_dir, config, active, now):
     """{account id: {holds, checked_at, valid_until}} for every account whose
     note is still current. Claude's one note is kept per account here, so an
     account parked since is still known. Claude drops its note when a reset is
@@ -2032,7 +2067,7 @@ def _unused_resets(state_dir, config, active, now):
     if not isinstance(kept, dict):
         kept = {}
     known = dict(kept)
-    noted = _noted_unused_reset(config)
+    noted = _noted_unused_reset(paths, config, active)
     if noted is not None:
         known[noted[0]] = noted[1]
     elif config is not None and "unusedLimitResetStatusCache" not in config:
@@ -2241,16 +2276,16 @@ def enrol(runtime=None):
 
 def _enrol_from(runtime, source):
     paths, store, state_dir, _ = runtime
-    name = input("account name: ").strip()
-    if not name:
-        print("A name is required")
-        return 1
+    # Empty takes the default: the e-mail, with the organization for a further one.
+    name = input("account name (Enter for its e-mail): ").strip() or None
     known = _enrolled_ids(paths)
     try:
         identifier = _enrol_between_rotations(runtime, name, source)
     except RuntimeError as error:
         print("Could not enrol: %s" % error)
         return 1
+    if name is None:
+        name = _name_of(accounts.load(paths, []), identifier)
     print("\nEnrolled %s as %s" % (name, identifier))
     if _unblock(state_dir, identifier, datetime.now(timezone.utc)):
         print("It had failed before, and is back in rotation")
@@ -2318,16 +2353,24 @@ def _enrol_between_rotations(runtime, name, source):
 
 
 
-ENROL_USAGE = "usage: grazr.py enrol (--from DIR | --stdin) --name NAME [--expect-email EMAIL] [--json]"
-_ENROL_VALUE_FLAGS = {"--from": "from_dir", "--name": "name", "--expect-email": "expect_email"}
+ENROL_USAGE = ("usage: grazr.py enrol (--from DIR | --stdin) --name NAME [--expect-email EMAIL] "
+               "[--expect-organization UUID] [--json]")
+_ENROL_VALUE_FLAGS = {
+    "--from": "from_dir", "--name": "name", "--expect-email": "expect_email",
+    "--expect-organization": "expect_organization",
+}
 _ENROL_SWITCHES = {"--stdin": "stdin", "--json": "as_json"}
 
 
 def _enrol_flags(arguments):
     """The flags of a non-interactive `enrol`. None unless they make one whole
     request: each flag once, a non-empty name, and exactly one login source.
-    An empty --expect-email is refused here, since it would check nothing."""
-    options = {"from_dir": None, "name": None, "expect_email": None, "stdin": False, "as_json": False}
+    An empty --expect-email or --expect-organization is refused here, since it
+    would check nothing."""
+    options = {
+        "from_dir": None, "name": None, "expect_email": None, "expect_organization": None,
+        "stdin": False, "as_json": False,
+    }
     seen = set()
     index = 0
     while index < len(arguments):
@@ -2371,7 +2414,8 @@ def _read_import(text):
     return identity, blob
 
 
-def enrol_noninteractive(from_dir=None, stdin=False, name=None, expect_email=None, as_json=False, runtime=None):
+def enrol_noninteractive(from_dir=None, stdin=False, name=None, expect_email=None, expect_organization=None,
+                         as_json=False, runtime=None):
     """`enrol` with its answers as flags, so the Orca plugin can enrol a login
     it signed in without a terminal. Same enrolment as the menu, without the
     prompts; the install side of _enrol_from is not repeated here."""
@@ -2398,17 +2442,23 @@ def enrol_noninteractive(from_dir=None, stdin=False, name=None, expect_email=Non
             with _rotation_lock(state_dir) as acquired:
                 if not acquired:
                     raise RuntimeError("Busy rotating, try again in a moment")
-                identifier = claude.enrol_identity(paths, store, name, identity, blob, expect_email)
+                identifier = claude.enrol_identity(
+                    paths, store, name, identity, blob, expect_email, expect_organization
+                )
         else:
             # An isolated login is one no swap touches, so no rotation lock is needed.
-            identifier = claude.enrol(paths, store, name, from_dir, expect_email)
+            identifier = claude.enrol(paths, store, name, from_dir, expect_email, expect_organization)
     except (RuntimeError, ValueError, OSError) as error:
         return refuse(str(error))
     # The enrol has happened by now, so nothing after it may turn it into a traceback.
     try:
-        email = accounts.read(paths, identifier).get("email")
+        stored = accounts.read(paths, identifier)
+        email = stored.get("email")
+        organization = stored.get("organization")
+        organization_uuid = accounts.login_of(stored)[1]
+        name = name or stored.get("name")
     except (OSError, ValueError, AttributeError):
-        email = None
+        email = organization = organization_uuid = None
     try:
         unblocked = _unblock(state_dir, identifier, datetime.now(timezone.utc))
     except Exception:
@@ -2420,6 +2470,7 @@ def enrol_noninteractive(from_dir=None, stdin=False, name=None, expect_email=Non
     if as_json:
         print(json.dumps({
             "ok": True, "id": identifier, "name": name, "email": email, "unblocked": unblocked, "ordered": ordered,
+            "organization_uuid": organization_uuid, "organization": organization,
         }))
     else:
         print("Enrolled %s as %s" % (name, identifier))
@@ -2533,7 +2584,14 @@ def token(runtime=None, target=None, verify=None, ask=None):
         print("That is not a Claude token (they start with %s), nothing stored" % TOKEN_PREFIX)
         return 1
     owner = (verify or claude.token_account)(pasted)
-    if owner is not None and owner.get("uuid") != account.id:
+    # The id is opaque and names an organization too, so the token's login is
+    # compared with the record's own, and its organization when both say.
+    login, organization = _login_of(paths, account.id)
+    owner_organization = (owner or {}).get("organization_uuid")
+    if owner is not None and (
+        str(owner.get("uuid") or "").lower() != login
+        or (organization and isinstance(owner_organization, str) and owner_organization.lower() != organization)
+    ):
         print("That token is for %s, not %s, so nothing was stored. Sign in as %s and try again"
               % (owner.get("email") or "another account", account.name, account.name))
         return 1

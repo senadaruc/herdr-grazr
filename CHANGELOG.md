@@ -4,6 +4,24 @@ Notable changes to *grazr*, newest first. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.4.7+fork.16 - 2026-11-23
+
+### Changed
+
+- An account is a login plus its organization. One Claude login can belong to several organizations, each with its own plan, and enrolling a second one used to overwrite the first one's credential and record. A login's first organization keeps the bare `accountUuid` as its id, so no install is renamed or migrated; each further one is enrolled as `<accountUuid>.<organizationUuid>`, with its own parked credential, record and pin token. The live account is found through the stored records by both uuids, so a reading on an organization that is not enrolled is no longer booked against the one that is. A record that stores no organization stays the login's bare id.
+- An account enrolled without a name takes the e-mail, and a further organization `<email>:<org-slug>`. The interactive enrol takes that default on Enter.
+- Claude Code's unused-reset note names a login only: it goes to the active account when it is the live login, to the login's one record otherwise, and is left out for a login with several organizations.
+- A pin token is checked against the account's login, and against its organization when Claude's profile names one.
+
+### Added
+
+- `enrol --expect-organization UUID` refuses, writing nothing, a login signed in to another organization. `enrol --json` replies also carry `organization_uuid` and `organization`.
+- `status --json` accounts carry `login` (the accountUuid) and `organization_uuid`; `active` carries `email`, `organization` and `organization_uuid` from the live login, so an organization that is not enrolled can be named.
+
+### Fixed
+
+- `python3 test_grazr.py`, as CI runs it, ran only the tests above its `unittest.main()` call; it now runs them all.
+
 ## 0.4.7+fork.15 - 2026-11-10
 
 ### Added

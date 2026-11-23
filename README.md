@@ -327,11 +327,13 @@ driven by the Orca plugin `senadaruc.grazr` instead of Herdr. Orca stays on its
 **System default** account, and *grazr* rotates that login. Orca's own managed
 accounts are never touched. The guard below says how.
 
-Sign-in without a terminal (used by the Orca plugin) runs on the same engine: `enrol --from DIR --name NAME [--expect-email EMAIL] --json` enrols an isolated login directory, `login-export --from DIR` prints that login as one JSON line, `enrol --stdin --name NAME ... --json` enrols such a line on another host, and `login-discard --from DIR` removes the throwaway login. Each refuses a managed Orca profile, as `enrol` does.
+Sign-in without a terminal (used by the Orca plugin) runs on the same engine: `enrol --from DIR --name NAME [--expect-email EMAIL] [--expect-organization UUID] --json` enrols an isolated login directory, `login-export --from DIR` prints that login as one JSON line, `enrol --stdin --name NAME ... --json` enrols such a line on another host, and `login-discard --from DIR` removes the throwaway login. Each refuses a managed Orca profile, as `enrol` does.
 
 `status --json` gives each account an `updated` field: the unix time of its last recorded reading (the mtime of its state file), or `null` when unknown.
 
 It also gives each account an `unused_reset` field: `{"holds": true|false, "checked_at", "valid_until"}` (unix times) when Claude Code has noted whether the account holds an unused limit reset, or `null` when it has made no note or the note has lapsed. This is Claude Code's own note, kept per account as accounts rotate; it does not say which kind of reset or how many. Use one with `/limit-reset` in Claude Code on that account.
+
+One Claude login can belong to several organizations, and each is an account of its own. A login's first organization is enrolled under its `accountUuid`; each further one under `<accountUuid>.<organizationUuid>`, named `<email>:<org-slug>` unless a name is given. The id is opaque: `status --json` gives each account its `login` (accountUuid) and `organization_uuid`, and `active` the live login's `email`, `organization` and `organization_uuid`, so an organization that is not enrolled can still be named.
 
 Outside Herdr, `GRAZR_STATE_DIR` and `GRAZR_CONFIG_DIR` name the state and
 config directories. They take precedence over `HERDR_PLUGIN_STATE_DIR` and

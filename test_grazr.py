@@ -3215,8 +3215,8 @@ class StatusJsonTest(EnrolledPairFixture):
 
         self.assertEqual([entry["name"] for entry in report["accounts"]], ["personal", "work"])
         self.assertEqual(set(report["accounts"][0]), {
-            "id", "name", "email", "organization", "plan", "ultra", "parked", "snapshot", "blocked", "in_order",
-            "first_reading_due", "updated", "unused_reset",
+            "id", "name", "login", "organization_uuid", "email", "organization", "plan", "ultra", "parked",
+            "snapshot", "blocked", "in_order", "first_reading_due", "updated", "unused_reset",
         })
         self.assertEqual(report["accounts"][0]["id"], "uuid-personal")
         self.assertIsNone(report["accounts"][0]["snapshot"])
@@ -3225,7 +3225,10 @@ class StatusJsonTest(EnrolledPairFixture):
     def test_the_active_login_is_named_and_in_order(self):
         self.assertEqual(
             self.report()["active"],
-            {"id": "uuid-work", "name": "work", "enrolled": True, "in_order": True},
+            {
+                "id": "uuid-work", "name": "work", "enrolled": True, "in_order": True,
+                "email": None, "organization": None, "organization_uuid": None,
+            },
         )
 
     def test_an_active_login_that_is_not_enrolled_is_named_by_its_id(self):
@@ -3233,7 +3236,10 @@ class StatusJsonTest(EnrolledPairFixture):
 
         self.assertEqual(
             self.report()["active"],
-            {"id": "uuid-work", "name": "uuid-work", "enrolled": False, "in_order": False},
+            {
+                "id": "uuid-work", "name": "uuid-work", "enrolled": False, "in_order": False,
+                "email": None, "organization": None, "organization_uuid": None,
+            },
         )
 
     def test_no_login_means_no_active_account(self):
@@ -6753,9 +6759,6 @@ class UltraStatuslineTest(EnrolledPairFixture):
         self.assertFalse(grazr.status_report(self.runtime())["settings"]["ultra_no_session"])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 # PARKED_POLL_MINUTES: a parked account's reading used to freeze at the moment
 # grazr left it, so an account the server had refilled still read as spent.
@@ -7004,7 +7007,7 @@ class NonInteractiveEnrolTest(EnrolledPairFixture):
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(printed), {
             "ok": True, "id": self.NEW, "name": "new", "email": "new@imperum.io", "unblocked": False,
-            "ordered": True,
+            "ordered": True, "organization_uuid": None, "organization": "Imperum",
         })
         self.assertEqual(self.store.parked[self.NEW], self.BLOB)
         self.assertEqual(self.record()["name"], "new")
@@ -7284,3 +7287,264 @@ class NonInteractiveEnrolTest(EnrolledPairFixture):
 
         self.assertEqual(code, 2)
         self.assertIn("usage: grazr.py enrol", errors.getvalue())
+
+
+
+# One Claude login can belong to several organizations, each its own account.
+# The first keeps the bare accountUuid as its id, so no install is renamed; each
+# further one is enrolled as <accountUuid>.<organizationUuid>.
+LOGIN = "55555555-5555-4555-8555-555555555555"
+ORG_ONE = "66666666-6666-4666-8666-666666666666"
+ORG_TWO = "77777777-7777-4777-8777-777777777777"
+FURTHER = LOGIN + "." + ORG_TWO
+
+
+def org_identity(organization, name, email="sam@imperum.io"):
+    return {
+        "accountUuid": LOGIN, "emailAddress": email,
+        "organizationUuid": organization, "organizationName": name,
+    }
+
+
+class AccountIdTest(unittest.TestCase):
+    def test_a_uuid_or_two_joined_by_a_dot_is_an_id(self):
+        self.assertEqual(accounts.account_id(LOGIN.upper()), LOGIN)
+        self.assertEqual(accounts.account_id(LOGIN + "." + ORG_TWO.upper()), FURTHER)
+
+    def test_anything_else_is_refused(self):
+        for bogus in (LOGIN + ".", "." + LOGIN, FURTHER + "." + ORG_ONE, LOGIN + ".x", LOGIN + "/" + ORG_TWO):
+            with self.subTest(bogus=bogus), self.assertRaises(RuntimeError):
+                accounts.account_id(bogus)
+
+
+class OrganizationFixture(EnrolledPairFixture):
+    """The enrolled pair, beside a login enrolled under its first organization."""
+
+    def setUp(self):
+        super().setUp()
+        self.store = FakeStore(tokens=self.tokens)
+
+    def runtime(self):
+        return super().runtime()._replace(store=self.store)
+
+    def enrol_org(self, organization, name, blob, account_name=None, **expect):
+        runtime = self.runtime()
+        return claude.enrol_identity(
+            runtime.paths, self.store, account_name, org_identity(organization, name), blob, **expect
+        )
+
+    def record(self, identifier):
+        with open(os.path.join(self.state_dir, "accounts", identifier + ".json")) as handle:
+            return json.load(handle)
+
+    def write_live(self, organization, **extra):
+        oauth = dict(org_identity(organization, "Live org"), **extra)
+        with open(os.path.join(self.claude_dir, ".claude.json"), "w") as handle:
+            json.dump({"oauthAccount": oauth}, handle)
+
+
+class TwoOrganizationsEnrolTest(OrganizationFixture):
+    def test_each_organization_of_one_login_gets_its_own_record_and_credential(self):
+        first = self.enrol_org(ORG_ONE, "Acme", "BLOB-ONE")
+        further = self.enrol_org(ORG_TWO, "Beta Labs, Inc.", "BLOB-TWO")
+
+        self.assertEqual((first, further), (LOGIN, FURTHER))
+        self.assertEqual(self.store.parked[LOGIN], "BLOB-ONE")
+        self.assertEqual(self.store.parked[FURTHER], "BLOB-TWO")
+        self.assertEqual(self.record(LOGIN)["oauthAccount"]["organizationUuid"], ORG_ONE)
+        self.assertEqual(self.record(FURTHER)["oauthAccount"]["organizationUuid"], ORG_TWO)
+        self.assertEqual(self.record(LOGIN)["name"], "sam@imperum.io")
+        self.assertEqual(self.record(FURTHER)["name"], "sam@imperum.io:beta-labs-inc")
+
+    def test_enrolling_an_organization_again_keeps_its_id_and_name(self):
+        self.enrol_org(ORG_ONE, "Acme", "BLOB-ONE")
+        self.enrol_org(ORG_TWO, "Beta", "BLOB-TWO")
+
+        again = self.enrol_org(ORG_TWO, "Beta", "BLOB-TWO-AGAIN")
+
+        self.assertEqual(again, FURTHER)
+        self.assertEqual(self.store.parked, {LOGIN: "BLOB-ONE", FURTHER: "BLOB-TWO-AGAIN"})
+        self.assertEqual(self.record(FURTHER)["name"], "sam@imperum.io:beta")
+
+    def test_a_name_taken_by_another_organization_gets_a_suffix(self):
+        self.enrol_org(ORG_ONE, "Acme", "BLOB-ONE", account_name="sam@imperum.io:beta")
+
+        self.enrol_org(ORG_TWO, "Beta", "BLOB-TWO")
+
+        self.assertEqual(self.record(FURTHER)["name"], "sam@imperum.io:beta-2")
+
+    def test_an_organization_with_no_usable_name_is_named_by_its_uuid(self):
+        self.enrol_org(ORG_ONE, "Acme", "BLOB-ONE")
+
+        self.enrol_org(ORG_TWO, "!!!", "BLOB-TWO")
+
+        self.assertEqual(self.record(FURTHER)["name"], "sam@imperum.io:77777777")
+
+    def test_a_record_stored_without_an_organization_is_the_bare_id(self):
+        """Nothing says it is another organization, so enrolling fills it in."""
+        with open(os.path.join(self.state_dir, "accounts", LOGIN + ".json"), "w") as handle:
+            json.dump({"name": "legacy", "oauthAccount": {"accountUuid": LOGIN}}, handle)
+        self.write_live(ORG_ONE)
+
+        self.assertEqual(claude.active_account(self.runtime().paths), LOGIN)
+        self.assertEqual(self.enrol_org(ORG_ONE, "Acme", "BLOB-ONE", account_name="legacy"), LOGIN)
+        self.assertEqual(self.record(LOGIN)["oauthAccount"]["organizationUuid"], ORG_ONE)
+
+    def test_another_expected_organization_is_refused_and_nothing_is_written(self):
+        isolated = os.path.join(self.directory, "enrol-org")
+        os.makedirs(isolated)
+        with open(os.path.join(isolated, ".claude.json"), "w") as handle:
+            json.dump({"oauthAccount": org_identity(ORG_TWO, "Beta")}, handle)
+        self.store.isolated[isolated] = "BLOB-TWO"
+
+        code, printed = self.invoke(lambda runtime: grazr.enrol_noninteractive(
+            runtime=runtime, from_dir=isolated, name="beta", expect_organization=ORG_ONE, as_json=True,
+        ))
+
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(printed), {
+            "ok": False, "error": "signed in to organization %s, expected %s" % (ORG_TWO, ORG_ONE),
+        })
+        self.assertEqual(self.store.parked, {})
+        self.assertEqual(sorted(os.listdir(os.path.join(self.state_dir, "accounts"))),
+                         ["uuid-personal.json", "uuid-work.json"])
+
+    def test_the_expected_organization_enrols_and_the_reply_names_it(self):
+        self.enrol_org(ORG_ONE, "Acme", "BLOB-ONE")
+        exported = json.dumps({"identity": org_identity(ORG_TWO, "Beta"), "blob": json.dumps(
+            {"claudeAiOauth": {"accessToken": "SECRET"}})})
+
+        with mock.patch("sys.stdin", io.StringIO(exported)):
+            code, printed = self.invoke(lambda runtime: grazr.enrol_noninteractive(
+                runtime=runtime, stdin=True, name="beta", expect_organization=ORG_TWO.upper(), as_json=True,
+            ))
+
+        self.assertEqual(code, 0)
+        reply = json.loads(printed)
+        self.assertEqual((reply["id"], reply["organization_uuid"], reply["organization"]), (FURTHER, ORG_TWO, "Beta"))
+        self.assertNotIn("SECRET", printed)
+
+    def test_the_flag_is_parsed_and_must_not_be_empty(self):
+        parsed = grazr._enrol_flags(["--from", "/d", "--name", "n", "--expect-organization", ORG_ONE])
+        self.assertEqual(parsed["expect_organization"], ORG_ONE)
+        self.assertIsNone(grazr._enrol_flags(["--from", "/d", "--name", "n", "--expect-organization", ""]))
+
+
+class LiveOrganizationTest(OrganizationFixture):
+    def payload(self, used):
+        return json.dumps({"rate_limits": {"five_hour": {"used_percentage": used, "resets_at": None}}})
+
+    def test_a_reading_on_an_organization_not_enrolled_is_not_booked_on_the_enrolled_one(self):
+        self.enrol_org(ORG_ONE, "Acme", "BLOB-ONE")
+        self.write_live(ORG_TWO)
+
+        self.invoke(lambda runtime: grazr.statusline(runtime, self.payload(used=10), detach=lambda: None))
+        report = grazr.status_report(self.runtime())
+
+        self.assertIsNone(self.record(LOGIN)["snapshot"])
+        self.assertEqual(report["active"], {
+            "id": FURTHER, "name": FURTHER, "enrolled": False, "in_order": False,
+            "email": "sam@imperum.io", "organization": "Live org", "organization_uuid": ORG_TWO,
+        })
+
+    def test_each_account_reports_its_login_and_organization(self):
+        self.enrol_org(ORG_ONE, "Acme", "BLOB-ONE")
+        self.enrol_org(ORG_TWO, "Beta", "BLOB-TWO")
+        self.write_live(ORG_TWO)
+
+        report = grazr.status_report(self.runtime())
+        by_id = {entry["id"]: entry for entry in report["accounts"]}
+
+        self.assertEqual((by_id[LOGIN]["login"], by_id[LOGIN]["organization_uuid"]), (LOGIN, ORG_ONE))
+        self.assertEqual((by_id[FURTHER]["login"], by_id[FURTHER]["organization_uuid"]), (LOGIN, ORG_TWO))
+        self.assertEqual((by_id["uuid-work"]["login"], by_id["uuid-work"]["organization_uuid"]), ("uuid-work", None))
+        self.assertEqual(report["active"]["id"], FURTHER)
+        self.assertTrue(report["active"]["enrolled"])
+
+    def test_a_swap_between_two_organizations_installs_the_arriving_one(self):
+        self.enrol_org(ORG_ONE, "Acme", "BLOB-ONE")
+        self.enrol_org(ORG_TWO, "Beta", "BLOB-TWO")
+        self.write_live(ORG_ONE)
+        self.store.live = "BLOB-ONE-LIVE"
+        paths = self.runtime().paths
+
+        claude.rotate(paths, self.store, LOGIN, FURTHER, None)
+
+        with open(paths.config_path) as handle:
+            live = json.load(handle)["oauthAccount"]
+        self.assertEqual((live["accountUuid"], live["organizationUuid"]), (LOGIN, ORG_TWO))
+        self.assertEqual((self.store.live, self.store.parked[LOGIN]), ("BLOB-TWO", "BLOB-ONE-LIVE"))
+        self.assertEqual(claude.active_account(paths), FURTHER)
+
+    def note(self, login):
+        now_ms = time.time() * 1000
+        path = os.path.join(self.claude_dir, ".claude.json")
+        with open(path) as handle:
+            config = json.load(handle)
+        config["unusedLimitResetStatusCache"] = {
+            "accountUuid": login, "holdsUnusedReset": True,
+            "checkedAt": now_ms - 60000, "validUntil": now_ms + 3600000,
+        }
+        with open(path, "w") as handle:
+            json.dump(config, handle)
+
+    def held_resets(self):
+        return {
+            entry["id"]: entry["unused_reset"]["holds"]
+            for entry in grazr.status_report(self.runtime())["accounts"] if entry["unused_reset"]
+        }
+
+    def test_claudes_note_on_the_live_login_is_the_active_organizations(self):
+        self.enrol_org(ORG_ONE, "Acme", "BLOB-ONE")
+        self.enrol_org(ORG_TWO, "Beta", "BLOB-TWO")
+        self.write_live(ORG_TWO)
+        self.note(LOGIN)
+
+        self.assertEqual(self.held_resets(), {FURTHER: True})
+
+    def test_a_note_on_another_login_goes_to_its_only_record(self):
+        self.write_live(ORG_TWO)
+        self.note("uuid-personal")
+
+        self.assertEqual(self.held_resets(), {"uuid-personal": True})
+
+    def test_a_note_on_another_login_with_several_organizations_is_dropped(self):
+        self.enrol_org(ORG_ONE, "Acme", "BLOB-ONE")
+        self.enrol_org(ORG_TWO, "Beta", "BLOB-TWO")
+        self.write_login("uuid-work")
+        self.note(LOGIN)
+
+        self.assertEqual(self.held_resets(), {})
+
+    def run_token(self, owner):
+        self.enrol_org(ORG_ONE, "Acme", "BLOB-ONE")
+        self.enrol_org(ORG_TWO, "Beta", "BLOB-TWO")
+        with mock.patch.object(grazr.subprocess, "run", lambda *a, **k: None), \
+                mock.patch.object(grazr, "read_key", lambda: "n"):
+            return self.invoke(lambda runtime: grazr.token(
+                runtime, "sam@imperum.io:beta", verify=lambda token: owner, ask=lambda prompt: "sk-ant-oat01-B"))
+
+    def test_a_pin_token_for_the_login_and_organization_is_stored_under_the_compound_id(self):
+        code, _ = self.run_token({"uuid": LOGIN.upper(), "email": "sam@imperum.io", "organization_uuid": ORG_TWO})
+
+        self.assertEqual((code, self.tokens), (0, {FURTHER: "sk-ant-oat01-B"}))
+
+    def test_a_pin_token_naming_no_organization_is_checked_by_its_login(self):
+        code, _ = self.run_token({"uuid": LOGIN, "email": "sam@imperum.io"})
+
+        self.assertEqual((code, self.tokens), (0, {FURTHER: "sk-ant-oat01-B"}))
+
+    def test_a_pin_token_for_another_login_or_organization_is_refused(self):
+        for owner in (
+            {"uuid": "uuid-work", "email": "work@x", "organization_uuid": ORG_TWO},
+            {"uuid": LOGIN, "email": "sam@imperum.io", "organization_uuid": ORG_ONE},
+        ):
+            with self.subTest(owner=owner):
+                code, printed = self.run_token(owner)
+
+                self.assertEqual((code, self.tokens), (1, {}))
+                self.assertIn("so nothing was stored", printed)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -218,8 +218,9 @@ PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
 
 
 def token_account(token, opener=urllib.request.urlopen):
-    """{"uuid", "email"} of the account a pin token belongs to, or None when
-    Claude will not say: a setup-token may lack the profile scope."""
+    """{"uuid", "email", "organization_uuid"} of the account a pin token
+    belongs to, or None when Claude will not say: a setup-token may lack the
+    profile scope. The organization is None when the profile names none."""
     request = urllib.request.Request(PROFILE_URL, headers={
         "Authorization": "Bearer " + token,
         "anthropic-beta": "oauth-2025-04-20",
@@ -227,10 +228,15 @@ def token_account(token, opener=urllib.request.urlopen):
     })
     try:
         with opener(request, timeout=USAGE_TIMEOUT_SECONDS) as response:
-            account = json.loads(response.read().decode("utf-8"))["account"]
-        return {"uuid": account["uuid"], "email": account.get("email") or account.get("email_address")}
+            profile = json.loads(response.read().decode("utf-8"))
+        account = profile["account"]
+        owner = {"uuid": account["uuid"], "email": account.get("email") or account.get("email_address")}
     except (urllib.error.URLError, OSError, ValueError, UnicodeDecodeError, KeyError, TypeError):
         return None
+    organization = profile.get("organization") if isinstance(profile, dict) else None
+    organization = organization.get("uuid") if isinstance(organization, dict) else None
+    owner["organization_uuid"] = organization if isinstance(organization, str) and organization else None
+    return owner
 
 
 def _fetch_usage(blob, opener):
@@ -351,14 +357,19 @@ def _from_unix(seconds):
 
 
 def active_account(paths):
+    """The account id of the live login, enrolled or not. One login can belong
+    to several organizations, so the id comes from the login and its
+    organization together, through the stored records."""
     try:
         with open(paths.config_path) as handle:
-            return (json.load(handle).get("oauthAccount") or {}).get("accountUuid") or None
+            oauth = json.load(handle).get("oauthAccount") or {}
+        account_uuid, organization = oauth.get("accountUuid"), oauth.get("organizationUuid")
     except (OSError, ValueError, AttributeError):
         return None
+    return accounts.resolve(paths, account_uuid, organization)
 
 
-def enrol(paths, store, name, source_config_dir=None, expect_email=None):
+def enrol(paths, store, name, source_config_dir=None, expect_email=None, expect_organization=None):
     """Copy an existing login into grazr's keeping. Authentication is always
     Claude's own `claude auth login`; grazr never sees a password. `source_config_dir`
     is an isolated CLAUDE_CONFIG_DIR, so enrolling a second account never
@@ -376,16 +387,19 @@ def enrol(paths, store, name, source_config_dir=None, expect_email=None):
 
     with open(config_path) as handle:
         identity = (json.load(handle).get("oauthAccount") or {})
-    return enrol_identity(paths, store, name, identity, blob, expect_email)
+    return enrol_identity(paths, store, name, identity, blob, expect_email, expect_organization)
 
 
-def enrol_identity(paths, store, name, identity, blob, expect_email=None):
+def enrol_identity(paths, store, name, identity, blob, expect_email=None, expect_organization=None):
     """Park a credential blob and record its account, given the identity it
     belongs to. Shared by a login read from a config dir and one imported as
     JSON, so both leave identical records. Nothing is written when it refuses.
-    `expect_email` is compared case-insensitively: a login under another
-    address is refused rather than enrolled under the wrong account."""
-    account_id = accounts.account_id(identity.get("accountUuid"))
+    `expect_email` and `expect_organization` are compared case-insensitively:
+    a login under another address or organization is refused rather than
+    enrolled under the wrong account. `name` None takes accounts.default_name."""
+    if not isinstance(identity, dict):
+        identity = {}
+    account_id = accounts.new_id(paths, identity)
     # A non-string e-mail or organisation is stored as None rather than as whatever was sent.
     identity = dict(identity)
     for key in ("emailAddress", "organizationName"):
@@ -399,6 +413,19 @@ def enrol_identity(paths, store, name, identity, blob, expect_email=None):
                 "signed in as %s, expected %s"
                 % (signed_in or "an account with no e-mail", expect_email)
             )
+    if expect_organization is not None:
+        organization = identity.get("organizationUuid")
+        organization = organization if isinstance(organization, str) else ""
+        if organization.lower() != expect_organization.lower():
+            raise RuntimeError(
+                "signed in to organization %s, expected %s"
+                % (organization or "none", expect_organization)
+            )
+
+    if name is None:
+        name = accounts.default_name(paths, identity, account_id)
+        if not name:
+            raise RuntimeError("That login has no e-mail to name it by, so a name is required")
 
     # Accounts are looked up by name, so a duplicate hides one of them for good.
     for existing in accounts.load(paths, []):

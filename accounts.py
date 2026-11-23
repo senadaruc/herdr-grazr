@@ -6,6 +6,7 @@ the file, its name and the parked snapshot are grazr's own.
 
 import json
 import os
+import re
 import uuid
 from datetime import datetime, timezone
 
@@ -23,18 +24,161 @@ def parse_time(value):
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
-def account_id(value):
-    """The server's account id becomes a filename and a keychain service, so it
-    has to be a plain uuid and nothing else."""
+def _canonical_uuid(value):
+    """The lowercase canonical form of a uuid, or None for anything else.
+    Compared case-insensitively: some providers return uppercase, and it is
+    the same account."""
     try:
-        # Compared case-insensitively: some providers return uppercase, and it
-        # is the same account. The canonical lowercase form is what gets used.
         canonical = str(uuid.UUID(str(value)))
         if canonical == value.lower():
             return canonical
     except (AttributeError, TypeError, ValueError):
         pass
+    return None
+
+
+def account_id(value):
+    """An account id becomes a filename and a keychain service, so it has to be
+    a plain uuid, or two of them joined by a dot, and nothing else. The second
+    form names a further organization of one login (see new_id)."""
+    parts = value.split(".") if isinstance(value, str) else [value]
+    canonical = [_canonical_uuid(part) for part in parts]
+    if 1 <= len(parts) <= 2 and None not in canonical:
+        return ".".join(canonical)
     raise RuntimeError("That login has no usable account identity: %r" % (value,))
+
+
+def login_of(record):
+    """(accountUuid, organizationUuid) of a stored record's `oauthAccount`,
+    lowercase, either None when it is missing. A login can belong to several
+    organizations, and the pair is what tells their accounts apart."""
+    oauth = record.get("oauthAccount") if isinstance(record, dict) else None
+    if not isinstance(oauth, dict):
+        return None, None
+    account, organization = oauth.get("accountUuid"), oauth.get("organizationUuid")
+    return (
+        account.lower() if isinstance(account, str) and account else None,
+        organization.lower() if isinstance(organization, str) and organization else None,
+    )
+
+
+def records(paths):
+    """(id, record) for every readable account file, sorted by id."""
+    try:
+        filenames = sorted(os.listdir(paths.accounts_dir))
+    except OSError:
+        return []
+    found = []
+    for filename in filenames:
+        if filename.startswith(".") or not filename.endswith(".json"):
+            continue
+        identifier = filename[: -len(".json")]
+        try:
+            stored = read(paths, identifier)
+        except (OSError, ValueError):
+            continue
+        if isinstance(stored, dict):
+            found.append((identifier, stored))
+    return found
+
+
+def _bare(account_uuid):
+    """The id of a login's first organization: its uuid, canonical when it is one."""
+    return _canonical_uuid(account_uuid) or account_uuid
+
+
+def records_of_login(paths, account_uuid):
+    """(id, stored organizationUuid) of every record of one login. A record with
+    no stored accountUuid counts by its id, as records written before the
+    identity was stored did."""
+    wanted = str(account_uuid).lower()
+    bare = _bare(account_uuid)
+    found = []
+    for identifier, stored in records(paths):
+        login, organization = login_of(stored)
+        if login == wanted or (login is None and identifier == bare):
+            found.append((identifier, organization))
+    return found
+
+
+def resolve(paths, account_uuid, org_uuid):
+    """The account id of a live login, which need not be enrolled. The id is
+    opaque, so it is only ever found through the stored records: the record of
+    that login and organization; else the login's bare uuid when its record
+    stores no organization, or the live one is unknown and the login has one
+    record only; else the id a further organization is enrolled under."""
+    if not isinstance(account_uuid, str) or not account_uuid:
+        return None
+    organization = _canonical_uuid(org_uuid)
+    bare = _bare(account_uuid)
+    found = records_of_login(paths, account_uuid)
+    if organization is not None:
+        for identifier, stored in found:
+            if stored == organization:
+                return identifier
+    if any(identifier == bare and stored is None for identifier, stored in found):
+        return bare
+    if organization is None:
+        return found[0][0] if len(found) == 1 else bare
+    return "%s.%s" % (bare, organization)
+
+
+def new_id(paths, identity):
+    """The id to enrol `identity` under. A login's first organization keeps the
+    bare uuid, as every install before organizations were told apart did; each
+    further one gets `<accountUuid>.<organizationUuid>`. An organization already
+    enrolled keeps its id, and so does a record that stores no organization,
+    since nothing says it is another one."""
+    bare = account_id(identity.get("accountUuid"))
+    organization = _canonical_uuid(identity.get("organizationUuid"))
+    found = records_of_login(paths, bare)
+    if organization is not None:
+        for identifier, stored in found:
+            if stored == organization:
+                return identifier
+    if not os.path.exists(os.path.join(paths.accounts_dir, bare + ".json")):
+        return bare
+    if any(identifier == bare and stored is None for identifier, stored in found):
+        return bare
+    if organization is None:
+        if len(found) == 1:
+            return found[0][0]
+        raise RuntimeError(
+            "That login names no organization, and grazr holds several of its "
+            "organizations, so it cannot tell which one it is"
+        )
+    return account_id("%s.%s" % (bare, organization))
+
+
+NAME_SLUG_LENGTH = 24
+
+
+def default_name(paths, identity, identifier):
+    """The name an account is enrolled under when the caller gives none: its
+    own when it is enrolled already, the e-mail for a login's first
+    organization, `<email>:<org-slug>` for a further one. No whitespace, since
+    ACCOUNTS is split on it. None when there is nothing to name it by."""
+    try:
+        current = read(paths, identifier).get("name")
+    except (OSError, ValueError, AttributeError):
+        current = None
+    if isinstance(current, str) and current:
+        return current
+    email = identity.get("emailAddress")
+    email = "".join(email.split()) if isinstance(email, str) else ""
+    bare = account_id(identity.get("accountUuid"))
+    if identifier == bare:
+        return email or None
+    organization = identity.get("organizationName")
+    slug = re.sub(r"[^a-z0-9]+", "-", organization.lower() if isinstance(organization, str) else "")
+    slug = slug.strip("-")[:NAME_SLUG_LENGTH].strip("-")
+    slug = slug or (_canonical_uuid(identity.get("organizationUuid")) or "org")[:8]
+    base = "%s:%s" % (email or bare[:8], slug)
+    taken = {entry.name for entry in load(paths, []) if entry.id != identifier}
+    name, suffix = base, 2
+    while name in taken:
+        name, suffix = "%s-%d" % (base, suffix), suffix + 1
+    return name
 
 
 def has_parked_credential(store, identifier):
