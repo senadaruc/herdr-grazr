@@ -3345,13 +3345,13 @@ class StatusJsonTest(EnrolledPairFixture):
         path = os.path.join(self.state_dir, "accounts", "uuid-personal.json")
         with open(path) as handle:
             stored = json.load(handle)
-        stored["organization"] = "Imperum"
+        stored["organization"] = "Acme Corp"
         with open(path, "w") as handle:
             json.dump(stored, handle)
 
         by_name = {entry["name"]: entry for entry in self.report()["accounts"]}
 
-        self.assertEqual(by_name["personal"]["organization"], "Imperum")
+        self.assertEqual(by_name["personal"]["organization"], "Acme Corp")
         self.assertIsNone(by_name["work"]["organization"])
 
     def set_stored_oauth(self, identifier, oauth):
@@ -6982,8 +6982,8 @@ class NonInteractiveEnrolTest(EnrolledPairFixture):
             json.dump({"oauthAccount": self.identity()}, handle)
         self.store = FakeStore(isolated={self.isolated: self.BLOB}, tokens=self.tokens)
 
-    def identity(self, email="new@imperum.io"):
-        return {"accountUuid": self.NEW, "emailAddress": email, "organizationName": "Imperum"}
+    def identity(self, email="new@example.com"):
+        return {"accountUuid": self.NEW, "emailAddress": email, "organizationName": "Acme Corp"}
 
     def runtime(self):
         return super().runtime()._replace(store=self.store)
@@ -7006,8 +7006,8 @@ class NonInteractiveEnrolTest(EnrolledPairFixture):
 
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(printed), {
-            "ok": True, "id": self.NEW, "name": "new", "email": "new@imperum.io", "unblocked": False,
-            "ordered": True, "organization_uuid": None, "organization": "Imperum",
+            "ok": True, "id": self.NEW, "name": "new", "email": "new@example.com", "unblocked": False,
+            "ordered": True, "organization_uuid": None, "organization": "Acme Corp",
         })
         self.assertEqual(self.store.parked[self.NEW], self.BLOB)
         self.assertEqual(self.record()["name"], "new")
@@ -7042,17 +7042,17 @@ class NonInteractiveEnrolTest(EnrolledPairFixture):
         self.assertEqual(self.config_text(), 'ACCOUNTS="work personal"\n')
 
     def test_expect_email_matches_case_insensitively(self):
-        code, printed = self.enrol(from_dir=self.isolated, name="new", expect_email="NEW@Imperum.IO", as_json=True)
+        code, printed = self.enrol(from_dir=self.isolated, name="new", expect_email="NEW@example.com", as_json=True)
 
         self.assertEqual(code, 0)
         self.assertTrue(json.loads(printed)["ok"])
 
     def test_a_login_under_another_address_is_refused_and_nothing_is_written(self):
-        code, printed = self.enrol(from_dir=self.isolated, name="new", expect_email="other@imperum.io", as_json=True)
+        code, printed = self.enrol(from_dir=self.isolated, name="new", expect_email="other@example.com", as_json=True)
 
         self.assertEqual(code, 1)
         self.assertEqual(json.loads(printed), {
-            "ok": False, "error": "signed in as new@imperum.io, expected other@imperum.io",
+            "ok": False, "error": "signed in as new@example.com, expected other@example.com",
         })
         self.assertEqual(self.store.parked, {})
         self.assertFalse(os.path.exists(self.record_path()))
@@ -7060,7 +7060,7 @@ class NonInteractiveEnrolTest(EnrolledPairFixture):
     def test_the_same_refusal_holds_for_an_import(self):
         exported = json.dumps({"identity": self.identity(), "blob": self.BLOB})
         with mock.patch("sys.stdin", io.StringIO(exported)):
-            code, printed = self.enrol(stdin=True, name="new", expect_email="other@imperum.io", as_json=True)
+            code, printed = self.enrol(stdin=True, name="new", expect_email="other@example.com", as_json=True)
 
         self.assertEqual(code, 1)
         self.assertFalse(json.loads(printed)["ok"])
@@ -7075,10 +7075,10 @@ class NonInteractiveEnrolTest(EnrolledPairFixture):
         self.assertEqual(self.store.parked, {})
 
     def test_without_json_a_refusal_is_a_line_on_screen(self):
-        code, printed = self.enrol(from_dir=self.isolated, name="new", expect_email="other@imperum.io")
+        code, printed = self.enrol(from_dir=self.isolated, name="new", expect_email="other@example.com")
 
         self.assertEqual(code, 1)
-        self.assertEqual(printed, "grazr: signed in as new@imperum.io, expected other@imperum.io\n")
+        self.assertEqual(printed, "grazr: signed in as new@example.com, expected other@example.com\n")
 
     def test_export_prints_one_json_line_and_nothing_else(self):
         code, printed = self.invoke(lambda runtime: grazr.login_export(runtime=runtime, from_dir=self.isolated))
@@ -7299,7 +7299,7 @@ ORG_TWO = "77777777-7777-4777-8777-777777777777"
 FURTHER = LOGIN + "." + ORG_TWO
 
 
-def org_identity(organization, name, email="sam@imperum.io"):
+def org_identity(organization, name, email="sam@example.com"):
     return {
         "accountUuid": LOGIN, "emailAddress": email,
         "organizationUuid": organization, "organizationName": name,
@@ -7353,8 +7353,8 @@ class TwoOrganizationsEnrolTest(OrganizationFixture):
         self.assertEqual(self.store.parked[FURTHER], "BLOB-TWO")
         self.assertEqual(self.record(LOGIN)["oauthAccount"]["organizationUuid"], ORG_ONE)
         self.assertEqual(self.record(FURTHER)["oauthAccount"]["organizationUuid"], ORG_TWO)
-        self.assertEqual(self.record(LOGIN)["name"], "sam@imperum.io")
-        self.assertEqual(self.record(FURTHER)["name"], "sam@imperum.io:beta-labs-inc")
+        self.assertEqual(self.record(LOGIN)["name"], "sam@example.com")
+        self.assertEqual(self.record(FURTHER)["name"], "sam@example.com:beta-labs-inc")
 
     def test_enrolling_an_organization_again_keeps_its_id_and_name(self):
         self.enrol_org(ORG_ONE, "Acme", "BLOB-ONE")
@@ -7364,21 +7364,21 @@ class TwoOrganizationsEnrolTest(OrganizationFixture):
 
         self.assertEqual(again, FURTHER)
         self.assertEqual(self.store.parked, {LOGIN: "BLOB-ONE", FURTHER: "BLOB-TWO-AGAIN"})
-        self.assertEqual(self.record(FURTHER)["name"], "sam@imperum.io:beta")
+        self.assertEqual(self.record(FURTHER)["name"], "sam@example.com:beta")
 
     def test_a_name_taken_by_another_organization_gets_a_suffix(self):
-        self.enrol_org(ORG_ONE, "Acme", "BLOB-ONE", account_name="sam@imperum.io:beta")
+        self.enrol_org(ORG_ONE, "Acme", "BLOB-ONE", account_name="sam@example.com:beta")
 
         self.enrol_org(ORG_TWO, "Beta", "BLOB-TWO")
 
-        self.assertEqual(self.record(FURTHER)["name"], "sam@imperum.io:beta-2")
+        self.assertEqual(self.record(FURTHER)["name"], "sam@example.com:beta-2")
 
     def test_an_organization_with_no_usable_name_is_named_by_its_uuid(self):
         self.enrol_org(ORG_ONE, "Acme", "BLOB-ONE")
 
         self.enrol_org(ORG_TWO, "!!!", "BLOB-TWO")
 
-        self.assertEqual(self.record(FURTHER)["name"], "sam@imperum.io:77777777")
+        self.assertEqual(self.record(FURTHER)["name"], "sam@example.com:77777777")
 
     def test_a_record_stored_without_an_organization_is_the_bare_id(self):
         """Nothing says it is another organization, so enrolling fills it in."""
@@ -7444,7 +7444,7 @@ class LiveOrganizationTest(OrganizationFixture):
         self.assertIsNone(self.record(LOGIN)["snapshot"])
         self.assertEqual(report["active"], {
             "id": FURTHER, "name": FURTHER, "enrolled": False, "in_order": False,
-            "email": "sam@imperum.io", "organization": "Live org", "organization_uuid": ORG_TWO,
+            "email": "sam@example.com", "organization": "Live org", "organization_uuid": ORG_TWO,
         })
 
     def test_each_account_reports_its_login_and_organization(self):
@@ -7522,22 +7522,22 @@ class LiveOrganizationTest(OrganizationFixture):
         with mock.patch.object(grazr.subprocess, "run", lambda *a, **k: None), \
                 mock.patch.object(grazr, "read_key", lambda: "n"):
             return self.invoke(lambda runtime: grazr.token(
-                runtime, "sam@imperum.io:beta", verify=lambda token: owner, ask=lambda prompt: "sk-ant-oat01-B"))
+                runtime, "sam@example.com:beta", verify=lambda token: owner, ask=lambda prompt: "sk-ant-oat01-B"))
 
     def test_a_pin_token_for_the_login_and_organization_is_stored_under_the_compound_id(self):
-        code, _ = self.run_token({"uuid": LOGIN.upper(), "email": "sam@imperum.io", "organization_uuid": ORG_TWO})
+        code, _ = self.run_token({"uuid": LOGIN.upper(), "email": "sam@example.com", "organization_uuid": ORG_TWO})
 
         self.assertEqual((code, self.tokens), (0, {FURTHER: "sk-ant-oat01-B"}))
 
     def test_a_pin_token_naming_no_organization_is_checked_by_its_login(self):
-        code, _ = self.run_token({"uuid": LOGIN, "email": "sam@imperum.io"})
+        code, _ = self.run_token({"uuid": LOGIN, "email": "sam@example.com"})
 
         self.assertEqual((code, self.tokens), (0, {FURTHER: "sk-ant-oat01-B"}))
 
     def test_a_pin_token_for_another_login_or_organization_is_refused(self):
         for owner in (
             {"uuid": "uuid-work", "email": "work@x", "organization_uuid": ORG_TWO},
-            {"uuid": LOGIN, "email": "sam@imperum.io", "organization_uuid": ORG_ONE},
+            {"uuid": LOGIN, "email": "sam@example.com", "organization_uuid": ORG_ONE},
         ):
             with self.subTest(owner=owner):
                 code, printed = self.run_token(owner)
